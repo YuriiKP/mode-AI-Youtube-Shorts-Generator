@@ -13,6 +13,11 @@ POLL_TIMEOUT_SECONDS = float(os.getenv("MUAPI_POLL_TIMEOUT", "600"))
 # Local-mode (--mode local) settings — only consulted when running offline.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip(
+    "/"
+)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
@@ -25,10 +30,13 @@ LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
 # Default min_speech_duration_ms is 250ms; increase to avoid tiny false positives
 # Default min_silence_duration_ms is 2000ms; increase to avoid splitting mid-sentence
 # DISABLED by default because VAD is too aggressive on mixed speech/music content
-LOCAL_WHISPER_VAD_FILTER = os.getenv("LOCAL_WHISPER_VAD_FILTER", "false").strip().lower() == "true"
+LOCAL_WHISPER_VAD_FILTER = (
+    os.getenv("LOCAL_WHISPER_VAD_FILTER", "false").strip().lower() == "true"
+)
 _vad_params_env = os.getenv("LOCAL_WHISPER_VAD_PARAMETERS", "")
 if _vad_params_env:
     import json
+
     LOCAL_WHISPER_VAD_PARAMETERS = json.loads(_vad_params_env)
 else:
     # Match faster-whisper defaults when VAD is enabled
@@ -56,6 +64,15 @@ def require_openai_key() -> str:
             "Add it to your .env or export it, or switch back to --mode api."
         )
     return OPENAI_API_KEY
+
+
+def require_deepseek_key() -> str:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY is not set. Local mode needs a DeepSeek key when LLM_PROVIDER=deepseek. "
+            "Add it to your .env or export it, or switch LLM_PROVIDER back to openai."
+        )
+    return DEEPSEEK_API_KEY
 
 
 def require_gemini_key() -> str:
