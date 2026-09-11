@@ -1,2 +1,10 @@
-requests>=2.31
 python-dotenv>=1.0
+
+# Local pipeline dependencies (download, transcription, ranking, crop).
+yt-dlp>=2024.1.1
+faster-whisper>=1.0.0
+openai>=1.0.0
+google-genai>=1.0.0
+opencv-python==4.8
+# torch is only needed if you want CUDA Whisper. CPU works without it.
+# torch>=2.0

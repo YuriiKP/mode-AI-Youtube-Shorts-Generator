@@ -6,16 +6,15 @@ Logic ported from ViralVadoo's transcript_analysis/highlight_generator.py:
   - virality-criteria prompt
   - score-based dedupe with overlap suppression
 
-The LLM call is pluggable via the `llm_fn` argument so the same prompts can
-drive either MuAPI (default, --mode api) or a direct local LLM client
-(--mode local).
+The LLM call is pluggable via the `llm_fn` argument; it defaults to the
+configured provider (OpenAI / DeepSeek / Gemini, selected by LLM_PROVIDER).
 """
 
 import json
 import re
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
-from . import muapi
+from .llm import call_llm
 
 LLMFn = Callable[[str], str]
 
@@ -106,46 +105,11 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 CHUNK_SIZE_SECONDS = 1200  # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800  # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
-GPT_CALL_TIMEOUT_SECONDS = (
-    300  # cap LLM polls at 5 min — a wedged call should fail fast
-)
 MAX_HIGHLIGHT_API_ATTEMPTS = 3
 
 
-def call_muapi_llm(prompt: str) -> str:
-    """Default LLM backend: MuAPI gpt-5-mini."""
-    result = muapi.run(
-        "gpt-5-mini",
-        {"prompt": prompt},
-        label="gpt-5-mini",
-        timeout=GPT_CALL_TIMEOUT_SECONDS,
-    )
-
-    outputs = result.get("outputs")
-    if (
-        isinstance(outputs, list)
-        and outputs
-        and isinstance(outputs[0], str)
-        and outputs[0].strip()
-    ):
-        return outputs[0]
-
-    for key in ("output", "text", "response", "result", "content"):
-        v = result.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-        if isinstance(v, dict):
-            inner = v.get("text") or v.get("content")
-            if isinstance(inner, str) and inner.strip():
-                return inner
-        if isinstance(v, list) and v and isinstance(v[0], str):
-            return v[0]
-
-    raise RuntimeError(f"Could not extract gpt-5-mini text from response: {result}")
-
-
 def _parse_json_loose(raw: str) -> Dict:
-    """gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse."""
+    """Some models wrap JSON in markdown fences — strip and parse."""
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
@@ -229,9 +193,7 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
     return cleaned
 
 
-def detect_content_type(
-    transcript: Dict, llm_fn: LLMFn = call_muapi_llm
-) -> Dict[str, str]:
+def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_llm) -> Dict[str, str]:
     segments = transcript.get("segments", [])
     sample = " ".join(s["text"] for s in segments[:25])[:3000]
     prompt = f"{CONTENT_TYPE_PROMPT}\n\nОбразец транскрипта:\n{sample}"
@@ -284,10 +246,10 @@ def call_highlight_api(
     duration: float,
     num_clips: int,
     is_chunk: bool = False,
-    llm_fn: LLMFn = call_muapi_llm,
+    llm_fn: LLMFn = call_llm,
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
-    # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
+    # doesn't have to generate a huge JSON payload (which can time out the model).
     target = max(num_clips * 2, 5)
     natural_max = max(2 if is_chunk else 3, int(duration / 90))
     min_clips = min(target, natural_max, 8)
@@ -365,14 +327,12 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
-    llm_fn: Optional[LLMFn] = None,
+    llm_fn: LLMFn = call_llm,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
-    `llm_fn` swaps the underlying LLM. Defaults to MuAPI gpt-5-mini; local
-    mode passes in a local LLM-backed callable.
+    `llm_fn` swaps the underlying LLM; it defaults to the configured provider.
     """
-    llm_fn = llm_fn or call_muapi_llm
     duration = transcript.get("duration", 0)
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(

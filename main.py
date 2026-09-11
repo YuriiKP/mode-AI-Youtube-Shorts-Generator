@@ -16,17 +16,24 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from shorts_generator import generate_shorts
+from shorts_generator import generate_shorts, generate_subtitles
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI YouTube Shorts Generator")
-    parser.add_argument("url", help="YouTube URL, file:// URL, or local file path")
     parser.add_argument(
-        "--mode",
-        choices=["api", "local"],
-        default="api",
-        help="api (default, MuAPI) or local (remote URL, file://, or local path + faster-whisper + LLM provider + ffmpeg).",
+        "url",
+        nargs="?",
+        help="YouTube URL, file:// URL, or local file path. In "
+        "--subtitles-only mode, a video file or a directory of videos.",
+    )
+    parser.add_argument(
+        "--subtitles-only",
+        action="store_true",
+        help="Only generate .srt subtitles for a local video file or every "
+        "video in a directory (passed as the positional path), skipping "
+        "highlight ranking and rendering. Each video gets a .srt next to it "
+        "with the same base name.",
     )
     parser.add_argument(
         "--num-clips",
@@ -51,13 +58,51 @@ def main() -> int:
         "--face-tracking",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Local mode: track faces for the vertical crop (default). "
+        help="Track faces for the vertical crop (default). "
         "Use --no-face-tracking for a static centre crop.",
     )
     parser.add_argument(
         "--output-json", default=None, help="Write the full result JSON to this path"
     )
     args = parser.parse_args()
+
+    # Subtitle-only mode: transcribe a file (or every video in a directory)
+    # into .srt files, skipping highlight ranking and rendering entirely.
+    if args.subtitles_only:
+        if not args.url:
+            parser.error("--subtitles-only requires a video file or directory path.")
+        input_path = args.url
+
+        try:
+            result = generate_subtitles(input_path=input_path, language=args.language)
+        except Exception as e:
+            print(f"\nFAILED: {e}", file=sys.stderr)
+            return 1
+
+        print("\n" + "=" * 72)
+        print("Mode:          subtitles-only")
+        print(f"Input:         {result['input']}")
+        print(f"Files:         {len(result['results'])}")
+        print("=" * 72)
+        for i, r in enumerate(result["results"], 1):
+            print(f"\n#{i}  {r.get('source_video')}")
+            if r.get("subtitle_path"):
+                print(
+                    f"     srt:    {r['subtitle_path']}  "
+                    f"({r.get('segments')} segments, {r.get('duration', 0):.0f}s)"
+                )
+            else:
+                print(f"     srt:    FAILED ({r.get('error')})")
+
+        if args.output_json:
+            with open(args.output_json, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"\nFull JSON written to {args.output_json}")
+
+        return 0
+
+    if not args.url:
+        parser.error("a YouTube URL, file:// URL, or local file path is required.")
 
     try:
         result = generate_shorts(
@@ -66,7 +111,6 @@ def main() -> int:
             aspect_ratio=args.aspect_ratio,
             download_format=args.format,
             language=args.language,
-            mode=args.mode,
             face_tracking=args.face_tracking,
         )
     except Exception as e:
@@ -74,7 +118,7 @@ def main() -> int:
         return 1
 
     print("\n" + "=" * 72)
-    print(f"Mode:          {result.get('mode', args.mode)}")
+    print(f"Mode:          {result.get('mode', 'local')}")
     print(f"Source video:  {result['source_video_url']}")
     print(
         f"Highlights:    {len(result['highlights'])} candidates → kept top {len(result['shorts'])}"
