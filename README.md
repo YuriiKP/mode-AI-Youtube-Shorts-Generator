@@ -103,7 +103,7 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    DEEPSEEK_BASE_URL=https://api.deepseek.com   # optional, default https://api.deepseek.com
    GEMINI_API_KEY=your_gemini_key_here
    GEMINI_MODEL=gemini-2.5-flash      # optional, default gemini-2.5-flash
-   LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
+   LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3-turbo / large-v3
    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
    ```

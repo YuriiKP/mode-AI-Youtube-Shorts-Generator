@@ -20,44 +20,86 @@ from . import muapi
 LLMFn = Callable[[str], str]
 
 
-CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
-Choose one: podcast, interview, tutorial, lecture, commentary, debate, vlog, other.
-Also estimate content density: low (mostly filler/chit-chat), medium, or high (dense info/stories).
-Respond with JSON only: {"content_type": "...", "density": "..."}"""
+# --- English prompts (commented out; the Russian versions below are used) ---
+#
+# CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
+# Choose one: podcast, interview, tutorial, lecture, commentary, debate, vlog, other.
+# Also estimate content density: low (mostly filler/chit-chat), medium, or high (dense info/stories).
+# Respond with JSON only: {"content_type": "...", "density": "..."}"""
+#
+#
+# VIRALITY_CRITERIA = """
+# Virality signals to prioritize (ranked by impact):
+# 1. HOOK MOMENTS — statements that create immediate curiosity ("The secret is...", "Nobody talks about...", "I was completely wrong about...")
+# 2. EMOTIONAL PEAKS — genuine surprise, laughter, anger, vulnerability, excitement; raw unscripted reactions
+# 3. OPINION BOMBS — strong, polarizing or counter-intuitive statements that trigger agree/disagree
+# 4. REVELATION MOMENTS — surprising facts, stats, or confessions that reframe how the viewer thinks
+# 5. CONFLICT/TENSION — disagreement, pushback, or a problem being confronted head-on
+# 6. QUOTABLE ONE-LINERS — a sentence that works as a standalone quote card
+# 7. STORY PEAKS — the climax or twist of an anecdote; the payoff moment
+# 8. PRACTICAL VALUE — a concrete tip, hack, or insight the viewer can immediately apply
+# """
+#
+# HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
+#
+# {virality_criteria}
+#
+# Content type: {content_type} | Density: {density}
+#
+# Your task: identify the most viral-worthy highlights from the transcript.
+#
+# Rules:
+# - Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
+# - Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect standalone one-liner. Go longer (91-180s) only when a story arc needs full context to land
+# - Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
+# - Clips must not overlap significantly with each other
+# - Score 0-100 on viral potential (not general quality)
+# - {num_clips_instruction}
+# - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
+# - Explain in one sentence why this clip is viral ("virality_reason")
+#
+# Respond ONLY with valid JSON (no markdown, no explanation):
+# {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+
+
+# --- Russian prompts ---
+CONTENT_TYPE_PROMPT = """Проанализируй этот образец транскрипта видео и определи тип контента.
+Выбери один: podcast, interview, tutorial, lecture, commentary, debate, vlog, other.
+Также оцени плотность контента: low (в основном вода и болтовня), medium или high (плотная информация/истории).
+Отвечай ТОЛЬКО в формате JSON: {"content_type": "...", "density": "..."}"""
 
 
 VIRALITY_CRITERIA = """
-Virality signals to prioritize (ranked by impact):
-1. HOOK MOMENTS — statements that create immediate curiosity ("The secret is...", "Nobody talks about...", "I was completely wrong about...")
-2. EMOTIONAL PEAKS — genuine surprise, laughter, anger, vulnerability, excitement; raw unscripted reactions
-3. OPINION BOMBS — strong, polarizing or counter-intuitive statements that trigger agree/disagree
-4. REVELATION MOMENTS — surprising facts, stats, or confessions that reframe how the viewer thinks
-5. CONFLICT/TENSION — disagreement, pushback, or a problem being confronted head-on
-6. QUOTABLE ONE-LINERS — a sentence that works as a standalone quote card
-7. STORY PEAKS — the climax or twist of an anecdote; the payoff moment
-8. PRACTICAL VALUE — a concrete tip, hack, or insight the viewer can immediately apply
+Сигналы виральности, которые нужно учитывать в первую очередь (по убыванию силы воздействия):
+1. ХУКИ — фразы, мгновенно вызывающие любопытство («Секрет в том, что...», «Никто не говорит об этом...», «Я полностью ошибался насчёт...»)
+2. ЭМОЦИОНАЛЬНЫЕ ПИКИ — искреннее удивление, смех, злость, уязвимость, восторг; неподдельные незаскриптованные реакции
+3. МНЕНИЯ-БОМБЫ — сильные, поляризующие или контринтуитивные заявления, провоцирующие согласие/несогласие
+4. МОМЕНТЫ ОТКРОВЕНИЯ — неожиданные факты, цифры или признания, меняющие взгляд зрителя
+5. КОНФЛИКТ/НАПРЯЖЕНИЕ — спор, сопротивление или проблема, с которой сталкиваются лицом к лицу
+6. ЦИТИРУЕМЫЕ ОДНОСТРОЧНИКИ — фраза, которая работает как отдельная карточка-цитата
+7. ПИКИ ИСТОРИЙ — кульминация или поворот истории; момент развязки
+8. ПРАКТИЧЕСКАЯ ПОЛЬЗА — конкретный совет, лайфхак или инсайт, который зритель может сразу применить
 """
 
-
-HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
+HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротких вертикальных видео, изучивший тысячи вирусных клипов в TikTok, Instagram Reels и YouTube Shorts. Ты точно знаешь, что заставляет зрителей прекратить листать, досматривать до конца и делиться.
 
 {virality_criteria}
 
-Content type: {content_type} | Density: {density}
+Тип контента: {content_type} | Плотность: {density}
 
-Your task: identify the most viral-worthy highlights from the transcript.
+Твоя задача: определить самые виральные моменты (хайлайты) в транскрипте.
 
-Rules:
-- Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
-- Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect standalone one-liner. Go longer (91-180s) only when a story arc needs full context to land
-- Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
-- Clips must not overlap significantly with each other
-- Score 0-100 on viral potential (not general quality)
+Правила:
+- Каждый хайлайт должен начинаться с сильного ХУКА — фразы, которая захватывает внимание в первые 3 секунды
+- Оптимальная длительность: 45-90 секунд. Короче (20-44с) — только для идеального самодостаточного однострочника. Длиннее (91-180с) — только когда сюжетной арке нужен полный контекст, чтобы сработать
+- Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным
+- Клипы не должны существенно пересекаться друг с другом
+- Оценка 0-100 по виральному потенциалу (а не по общему качеству)
 - {num_clips_instruction}
-- For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
-- Explain in one sentence why this clip is viral ("virality_reason")
+- Для каждого хайлайта определи единственную лучшую "hook_sentence" — начальную фразу, которая заставит зрителя прекратить листать
+- Объясни одним предложением, почему этот клип виральный ("virality_reason")
 
-Respond ONLY with valid JSON (no markdown, no explanation):
+Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
 {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
 
 
@@ -165,10 +207,21 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
         cleaned.append(
             {
                 "title": str(item.get("title") or "Untitled Highlight").strip(),
+                "clip_type": str(item.get("clip_type") or "").strip().lower(),
                 "start_time": start,
                 "end_time": end,
                 "score": max(0, min(100, _coerce_int(item.get("score"), default=0))),
+                "laugh_score": max(
+                    0, min(5, _coerce_int(item.get("laugh_score"), default=0))
+                ),
+                "cringe_score": max(
+                    0, min(5, _coerce_int(item.get("cringe_score"), default=0))
+                ),
+                "intrigue_score": max(
+                    0, min(5, _coerce_int(item.get("intrigue_score"), default=0))
+                ),
                 "hook_sentence": str(item.get("hook_sentence") or "").strip(),
+                "punchline": str(item.get("punchline") or "").strip(),
                 "virality_reason": str(item.get("virality_reason") or "").strip(),
             }
         )
@@ -181,7 +234,7 @@ def detect_content_type(
 ) -> Dict[str, str]:
     segments = transcript.get("segments", [])
     sample = " ".join(s["text"] for s in segments[:25])[:3000]
-    prompt = f"{CONTENT_TYPE_PROMPT}\n\nTranscript sample:\n{sample}"
+    prompt = f"{CONTENT_TYPE_PROMPT}\n\nОбразец транскрипта:\n{sample}"
     try:
         raw = llm_fn(prompt)
         return _parse_json_loose(raw)
@@ -242,9 +295,13 @@ def call_highlight_api(
         virality_criteria=VIRALITY_CRITERIA,
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
-        num_clips_instruction=f"Generate at least {min_clips} highlights",
+        num_clips_instruction=(
+            f"Верни НЕ БОЛЬШЕ {min_clips} клипов, лучшие — первыми. "
+            f"Можно вернуть меньше — качество важнее количества. "
+            f"Никогда не добивай список слабыми моментами."
+        ),
     )
-    base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
+    base_prompt = f"{system}\n\nТранскрипт:\n{transcript_text}"
     prompt = base_prompt
     last_error = "unknown"
 
@@ -273,9 +330,10 @@ def call_highlight_api(
         if attempt < MAX_HIGHLIGHT_API_ATTEMPTS:
             prompt = (
                 base_prompt
-                + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
-                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason."
-                + " No markdown fences, no commentary."
+                + "\n\nВАЖНО: верни ТОЛЬКО валидный JSON с массивом 'highlights' верхнего уровня."
+                + " Каждый элемент обязан содержать: clip_type, title, start_time, end_time, score,"
+                + " laugh_score, cringe_score, intrigue_score, hook_sentence, punchline, virality_reason."
+                + " Без markdown-ограждений, без комментариев."
             )
 
     raise RuntimeError(

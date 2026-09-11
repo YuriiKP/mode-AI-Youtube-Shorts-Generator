@@ -81,11 +81,14 @@ def main() -> int:
     )
     print("=" * 72)
     for i, s in enumerate(result["shorts"], 1):
+        ctype = s.get("clip_type") or "other"
         print(
-            f"\n#{i}  score={s.get('score')}  {s.get('start_time'):.1f}s → {s.get('end_time'):.1f}s"
+            f"\n#{i}  score={s.get('score')}  [{ctype}]  {s.get('start_time'):.1f}s → {s.get('end_time'):.1f}s"
         )
         print(f"     title:  {s.get('title')}")
         print(f"     hook:   {s.get('hook_sentence')}")
+        if s.get("punchline"):
+            print(f"     punch:  {s.get('punchline')}")
         if s.get("clip_url"):
             print(f"     clip:   {s['clip_url']}")
         else:
