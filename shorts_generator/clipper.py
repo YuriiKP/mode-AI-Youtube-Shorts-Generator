@@ -11,7 +11,8 @@ import os
 import subprocess
 from typing import Dict, List, Optional, Tuple
 
-from .config import OUTPUT_DIR
+# Default output folder, used only when the caller does not pass one.
+DEFAULT_OUTPUT_DIR = "output"
 
 
 def _ratio(aspect_ratio: str) -> float:
@@ -36,6 +37,17 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
         f"{start:.3f}",
         "-to",
         f"{end:.3f}",
+        # Keep a single video + audio stream and drop chapters / subtitles /
+        # data streams: leftover chapter metadata makes MoviePy's reader fail
+        # later in the pipeline (its parser crashes on single-chapter files).
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-map_chapters",
+        "-1",
+        "-sn",
+        "-dn",
         "-c:v",
         "libx264",
         "-preset",
@@ -168,6 +180,10 @@ def _reframe_vertical(
         "0:v:0",
         "-map",
         "1:a:0?",
+        "-map_chapters",
+        "-1",
+        "-sn",
+        "-dn",
         "-shortest",
         out_path,
     ]
@@ -202,7 +218,7 @@ def crop_highlights(
     out_dir: Optional[str] = None,
     face_tracking: bool = True,
 ) -> List[Dict]:
-    out_dir = out_dir or OUTPUT_DIR
+    out_dir = out_dir or DEFAULT_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict] = []
     for i, h in enumerate(highlights, 1):

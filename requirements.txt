@@ -1,10 +1,13 @@
-python-dotenv>=1.0
-
-# Local pipeline dependencies (download, transcription, ranking, crop).
+# Local pipeline: download, transcription, highlight ranking, vertical crop.
 yt-dlp>=2024.1.1
 faster-whisper>=1.0.0
 openai>=1.0.0
 google-genai>=1.0.0
 opencv-python==4.8
-# torch is only needed if you want CUDA Whisper. CPU works without it.
+# torch is only needed for CUDA Whisper; CPU works without it.
 # torch>=2.0
+
+# Post-processing engine: burn subtitles in and mix background music.
+moviepy==2.2.1
+Pillow>=10.0
+numpy>=1.25

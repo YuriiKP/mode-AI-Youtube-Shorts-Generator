@@ -8,3 +8,9 @@ output/
 *.mkv
 .DS_Store
 примеры команд.md
+
+# Local assets for the post-processing engine.
+music/
+fonts/
+banner/
+video/

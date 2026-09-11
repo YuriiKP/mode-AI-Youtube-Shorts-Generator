@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .config import OUTPUT_DIR
+# Default output folder, used only when the caller does not pass one.
+DEFAULT_OUTPUT_DIR = "output"
 
 
 def _import_ytdlp():
@@ -105,7 +106,7 @@ def download_youtube(
         return local_path
 
     yt_dlp = _import_ytdlp()
-    out_dir = out_dir or OUTPUT_DIR
+    out_dir = out_dir or DEFAULT_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
 
     video_id = _extract_youtube_video_id(video_url)

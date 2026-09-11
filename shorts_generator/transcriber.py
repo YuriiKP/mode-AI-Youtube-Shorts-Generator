@@ -1,29 +1,33 @@
 """Transcription via faster-whisper.
 
 Reads a local media file and returns the same shape the highlight generator
-expects: {duration, segments[start, end, text]}.
+expects: ``{duration, segments[start, end, text]}``. The result is cached as an
+``.srt`` file next to the source (or in ``OUTPUT_DIR``), so a second run — and
+the subtitle burn-in stage — reuse it instead of paying for Whisper again.
 """
 
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
-from .config import OUTPUT_DIR, WHISPER_DEVICE, WHISPER_MODEL
+from .config import Settings
 
 
-def _transcript_cache_path(media_path: str, cache_path: Optional[str] = None) -> Path:
-    """Return the .srt cache path for a media file.
+def _transcript_cache_path(
+    media_path: str, settings: Settings, cache_path: Optional[str] = None
+) -> Path:
+    """Return the ``.srt`` cache path for a media file.
 
-    When ``cache_path`` is given (e.g. a .srt sitting next to the video), that
-    exact path is used so the transcript is written alongside the source file.
-    Otherwise the cache lands in ``OUTPUT_DIR`` under the video's stem.
+    When ``cache_path`` is given (e.g. an ``.srt`` sitting next to the video),
+    that exact path is used. Otherwise the cache lands in ``OUTPUT_DIR`` under
+    the video's stem.
     """
     if cache_path:
         path = Path(cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
-    cache_dir = Path(OUTPUT_DIR)
+    cache_dir = Path(settings.output_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / (Path(media_path).stem + ".srt")
 
@@ -48,9 +52,12 @@ def _parse_srt_timestamp(value: str) -> float:
 
 
 def _write_srt_cache(
-    media_path: str, transcript: Dict, cache_path: Optional[str] = None
+    media_path: str,
+    transcript: Dict,
+    settings: Settings,
+    cache_path: Optional[str] = None,
 ) -> Path:
-    cache_path = _transcript_cache_path(media_path, cache_path=cache_path)
+    srt_path: Path = _transcript_cache_path(media_path, settings, cache_path=cache_path)
     lines = []
     for idx, segment in enumerate(transcript.get("segments", []), start=1):
         start = _format_srt_timestamp(float(segment["start"]))
@@ -61,8 +68,8 @@ def _write_srt_cache(
         lines.append(text)
         lines.append("")
 
-    cache_path.write_text("\n".join(lines), encoding="utf-8")
-    return cache_path
+    srt_path.write_text("\n".join(lines), encoding="utf-8")
+    return srt_path
 
 
 def _load_srt_cache(cache_path: Path) -> Dict:
@@ -93,14 +100,14 @@ def _load_srt_cache(cache_path: Path) -> Dict:
     return {"duration": duration, "segments": segments}
 
 
-def _resolve_device() -> str:
-    if WHISPER_DEVICE != "auto":
-        return WHISPER_DEVICE
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
     try:
         import torch  # type: ignore
 
         if torch.cuda.is_available():
-            # Test that CUDA actually works (catches missing cuBLAS/cuDNN libs)
+            # Verify CUDA really works (catches missing cuBLAS/cuDNN libs).
             torch.zeros(1, device="cuda")
             return "cuda"
     except (ImportError, OSError, RuntimeError):
@@ -109,30 +116,37 @@ def _resolve_device() -> str:
 
 
 def transcribe(
-    media_path: str, language: Optional[str] = None, cache_path: Optional[str] = None
+    media_path: str,
+    settings: Settings,
+    *,
+    language: Optional[str] = None,
+    cache_path: Optional[str] = None,
 ) -> Dict:
-    """Run faster-whisper on a local file path, caching the result as .srt.
+    """Run faster-whisper on a local file, caching the result as ``.srt``.
 
-    Pass ``cache_path`` to control where the .srt cache lives (e.g. next to the
-    source video when generating subtitles only).
+    Args:
+        media_path: local path to a video/audio file.
+        settings: resolved configuration (model, device, VAD, output dir).
+        language: ISO-639-1 code to force; defaults to ``settings.whisper_language``.
+        cache_path: where to write the ``.srt`` cache (defaults to the video's
+            folder / ``OUTPUT_DIR``).
     """
-    cache_path = _transcript_cache_path(media_path, cache_path=cache_path)
-    if cache_path.exists():
+    language = language if language is not None else (settings.whisper_language or None)
+
+    srt_path = _transcript_cache_path(media_path, settings, cache_path=cache_path)
+    if srt_path.exists():
         source_mtime = os.path.getmtime(media_path)
-        cache_mtime = cache_path.stat().st_mtime
+        cache_mtime = srt_path.stat().st_mtime
         if cache_mtime >= source_mtime:
-            print(
-                f"[transcribe] reusing cached transcript: {cache_path}",
-                flush=True,
-            )
-            cached = _load_srt_cache(cache_path)
-            # Treat empty cache as invalid (likely from a failed/partial run) — delete and re-transcribe
+            print(f"[transcribe] reusing cached transcript: {srt_path}", flush=True)
+            cached = _load_srt_cache(srt_path)
+            # Treat an empty cache as invalid (likely a partial run) and re-run.
             if not cached["segments"] or cached["duration"] <= 0.0:
                 print(
-                    f"[transcribe] cache is empty/invalid, deleting: {cache_path}",
+                    f"[transcribe] cache is empty/invalid, deleting: {srt_path}",
                     flush=True,
                 )
-                cache_path.unlink(missing_ok=True)
+                srt_path.unlink(missing_ok=True)
             else:
                 print(
                     f"[transcribe] {len(cached['segments'])} cached segments, "
@@ -149,26 +163,25 @@ def transcribe(
             "    pip install -r requirements.txt"
         ) from e
 
-    device = _resolve_device()
+    device = _resolve_device(settings.whisper_device)
     compute_type = "float16" if device == "cuda" else "int8"
     print(
-        f"[transcribe] faster-whisper model={WHISPER_MODEL} device={device}",
+        f"[transcribe] faster-whisper model={settings.whisper_model} device={device}",
         flush=True,
     )
 
-    from .config import WHISPER_VAD_FILTER, WHISPER_VAD_PARAMETERS
+    model = WhisperModel(
+        settings.whisper_model, device=device, compute_type=compute_type
+    )
 
-    model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
-
-    transcribe_kwargs = {
+    transcribe_kwargs: Dict[str, Any] = {
         "audio": media_path,
         "language": language,
         "beam_size": 5,
         "condition_on_previous_text": False,
     }
-    if WHISPER_VAD_FILTER:
+    if settings.whisper_vad_filter:
         transcribe_kwargs["vad_filter"] = True
-        transcribe_kwargs["vad_parameters"] = WHISPER_VAD_PARAMETERS
     else:
         transcribe_kwargs["vad_filter"] = False
 
@@ -188,10 +201,9 @@ def transcribe(
         segments[-1]["end"] if segments else 0.0
     )
     print(
-        f"[transcribe] {len(segments)} segments, {duration:.0f}s of audio",
-        flush=True,
+        f"[transcribe] {len(segments)} segments, {duration:.0f}s of audio", flush=True
     )
     transcript = {"duration": duration, "segments": segments}
-    cache_path = _write_srt_cache(media_path, transcript, cache_path=cache_path)
-    print(f"[transcribe] wrote cache: {cache_path}", flush=True)
+    srt_path = _write_srt_cache(media_path, transcript, settings, cache_path=cache_path)
+    print(f"[transcribe] wrote cache: {srt_path}", flush=True)
     return transcript
