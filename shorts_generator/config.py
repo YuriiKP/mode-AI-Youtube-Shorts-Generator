@@ -253,9 +253,9 @@ class Settings:
     # Subtitles ------------------------------------------------------------
     subtitle_source: str = "auto"  # auto | file | whisper | none
     subtitle_file: str = ""
-    font_path: str = ""
-    font_name: str = "STHeitiMedium.ttc"
-    fonts_dir: str = "fonts"
+    # A single ``FONT`` value — a font file, a font file name looked up in the
+    # ``fonts/`` folder(s), or a folder of fonts to pick from (mirrors MUSIC).
+    font: str = "STHeitiMedium.ttc"
     font_size: int = 60
     text_fore_color: str = DEFAULT_TEXT_FORE_COLOR
     text_background_color: Optional[str] = None
@@ -332,9 +332,7 @@ _STR_FIELDS = {
     "whisper_language",
     "music",
     "subtitle_file",
-    "font_path",
-    "font_name",
-    "fonts_dir",
+    "font",
     "fit_aspect_ratio",
     "banner",
     "video_codec",
