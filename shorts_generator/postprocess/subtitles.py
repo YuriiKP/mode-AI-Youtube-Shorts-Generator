@@ -514,6 +514,7 @@ def build_subtitle_clips(
         max_chars=settings.subtitle_max_chars,
         max_words=settings.subtitle_max_words,
         max_duration=settings.subtitle_max_duration,
+        pause_threshold=settings.subtitle_pause_threshold,
     )
 
     # Shift the whole cue along the timeline: ``SUBTITLE_OFFSET`` compensates

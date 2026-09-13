@@ -114,6 +114,7 @@ def _apply_cue_split(transcript: Dict, settings: Settings) -> Dict:
         max_chars=settings.subtitle_max_chars,
         max_words=settings.subtitle_max_words,
         max_duration=settings.subtitle_max_duration,
+        pause_threshold=settings.subtitle_pause_threshold,
     )
     return {"duration": transcript.get("duration", 0.0), "segments": cues}
 

@@ -294,6 +294,10 @@ class Settings:
     subtitle_max_chars: int = 40
     subtitle_max_words: int = 9
     subtitle_max_duration: float = 3.5
+    # Silence (in seconds) between two words that forces a new cue when
+    # word-level timings are available, so a subtitle ends at a natural pause in
+    # speech — and the text clears from screen during the silence.
+    subtitle_pause_threshold: float = 0.6
     # Shift every burned-in cue along the timeline, in seconds. Positive values
     # make the text appear later, which compensates for Whisper word timings
     # that tend to lead the actual speech by a fraction of a second; negative
@@ -404,6 +408,7 @@ _FLOAT_FIELDS = {
     "banner_width_ratio",
     "banner_opacity",
     "subtitle_max_duration",
+    "subtitle_pause_threshold",
     "subtitle_animation_duration",
     "subtitle_offset",
 }
