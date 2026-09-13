@@ -55,6 +55,7 @@ python main.py all          # нарезка + музыка + субтитры �
 | `-i, --input` | видео, папка или ссылка (по умолчанию `INPUT`) |
 | `-o, --output-dir` | куда писать результат (по умолчанию `OUTPUT_DIR`) |
 | `-q, --quiet` | только предупреждения и ошибки |
+| `--no-timing` | не печатать в конце сводку затраченного времени |
 | `--env FILE` | дополнительный `.env` (наивысший приоритет) |
 
 ### Примеры
@@ -181,6 +182,26 @@ python main.py subtitles -i clip.mp4 --no-fit-vertical
    закрывает размытая копия видео), накладывается баннер, вшиваются субтитры,
    под звук подмешивается музыка.
 
+## Подсчёт времени
+
+Каждый запуск заканчивается сводкой, сколько времени ушло на каждый этап
+создания контента, — видно, где именно «съедается» время:
+
+```
+Time spent:
+
+  download        12.3s
+  transcribe      45.6s
+  highlights       3.2s
+  crop            88.1s
+  enhance         60.4s
+  ---------------------
+  total          209.7s
+```
+
+Замеры ведутся по «часам» процесса и включаются в JSON-результат под ключом
+`timings` (`--output-json`). Сводку можно отключить флагом `--no-timing`.
+
 ## Python API
 
 ```python
@@ -190,6 +211,7 @@ settings = load_settings(extra={"input": "URL", "num_clips": 5})
 result = generate_shorts(settings)            # enhance=True добавит музыку + субтитры
 for short in result["shorts"]:
     print(short["score"], short["title"], short["clip_url"])
+print(result["timings"]["total_seconds"], "seconds total")
 ```
 
 ## Структура проекта
@@ -209,6 +231,7 @@ shorts_generator/
 ├── subtitles.py            Whisper -> .srt
 ├── cues.py                 нарезка транскрипта на короткие реплики-субтитры
 ├── enhance.py              музыка + субтитры на каждый клип (команда all)
+├── timing.py                замер времени по этапам (download/transcribe/...)
 └── postprocess/            движок вшивания (субтитры + музыка + баннер + вертикальный кадр)
 ```
 

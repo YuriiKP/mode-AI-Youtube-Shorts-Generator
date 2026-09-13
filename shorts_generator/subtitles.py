@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import Settings
+from .timing import start_timer
 
 # Extensions treated as video files when scanning a directory. Kept broad on
 # purpose so common containers are picked up without extra configuration.
@@ -79,6 +80,7 @@ def generate_subtitles(
             {"source_video", "subtitle_path": None, "error"},
             ...
           ],
+          "timings": {...},   # per-stage wall-clock measurements
         }
     """
     from .transcriber import transcribe
@@ -91,6 +93,7 @@ def generate_subtitles(
     if not videos:
         raise RuntimeError(f"No video files found in: {source}")
 
+    timer = start_timer()
     print(f"[transcribe] {len(videos)} video file(s) to process", flush=True)
 
     results: List[Dict] = []
@@ -98,9 +101,10 @@ def generate_subtitles(
         print(f"[transcribe] {i}/{len(videos)}: {video}", flush=True)
         srt_path = subtitle_path_for(video)
         try:
-            transcript = transcribe(
-                video, settings, language=language, cache_path=srt_path
-            )
+            with timer.stage("transcribe"):
+                transcript = transcribe(
+                    video, settings, language=language, cache_path=srt_path
+                )
             if not transcript.get("segments"):
                 raise RuntimeError("Whisper produced no segments for this file.")
             print(f"[transcribe] wrote {srt_path}", flush=True)
@@ -118,4 +122,9 @@ def generate_subtitles(
                 {"source_video": video, "subtitle_path": None, "error": str(e)}
             )
 
-    return {"mode": "transcribe", "input": source, "results": results}
+    return {
+        "mode": "transcribe",
+        "input": source,
+        "results": results,
+        "timings": timer.as_dict(),
+    }

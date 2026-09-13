@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Sequence
 from .config import ConfigError, Settings, load_settings
 from .pipeline import generate_shorts, generate_subtitles, resolve_input_videos
 from .postprocess.log import setup_logging
+from .timing import get_timer, start_timer
 
 _EPILOG = """\
 examples:
@@ -56,6 +57,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--quiet",
         action="store_true",
         help="only print warnings and errors",
+    )
+    parser.add_argument(
+        "--no-timing",
+        dest="no_timing",
+        action="store_true",
+        help="do not print the summary of how long each stage took",
     )
 
 
@@ -403,6 +410,14 @@ def _print_shorts(result: Dict, enhanced: bool) -> None:
                 print(f"     enhance: FAILED ({short['enhance_error']})")
 
 
+def _print_timing() -> None:
+    """Print the per-stage wall-clock summary for the run, if any was recorded."""
+    timer = get_timer()
+    if timer.empty:
+        return
+    print("\n" + timer.report("Time spent"))
+
+
 def cmd_clip(settings: Settings, args: argparse.Namespace) -> int:
     result = generate_shorts(settings)
     _print_shorts(result, enhanced=False)
@@ -441,7 +456,10 @@ def _apply_to_inputs(
     """Run the post-processing engine over every input video."""
     from .postprocess.pipeline import run as postprocess_run
 
-    videos = resolve_input_videos(settings)
+    timer = start_timer()
+
+    with timer.stage("download"):
+        videos = resolve_input_videos(settings)
     out_dir = settings.resolve(settings.output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -450,13 +468,14 @@ def _apply_to_inputs(
     for i, video in enumerate(videos, 1):
         out_path = _output_path_for(video, out_dir)
         print(f"[post] {i}/{total}: {os.path.basename(video)}", flush=True)
-        postprocess_run(
-            video,
-            out_path,
-            settings,
-            burn_subtitles=burn_subtitles,
-            add_music=add_music,
-        )
+        with timer.stage("postprocess"):
+            postprocess_run(
+                video,
+                out_path,
+                settings,
+                burn_subtitles=burn_subtitles,
+                add_music=add_music,
+            )
         print(f"[post]   -> {out_path}", flush=True)
     return 0
 
@@ -523,13 +542,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     handler = _COMMANDS[args.command]
     try:
-        return handler(settings, args)
+        code = handler(settings, args)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
-        return 130
+        code = 130
     except Exception as exc:  # noqa: BLE001 - surface a clean message
         print(f"\nFAILED: {exc}", file=sys.stderr)
-        return 1
+        code = 1
+
+    if not getattr(args, "no_timing", False):
+        _print_timing()
+
+    return code
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -21,6 +21,7 @@ from .downloader import download_youtube
 from .enhance import enhance_shorts
 from .highlights import get_highlights
 from .subtitles import find_video_files
+from .timing import start_timer
 from .transcriber import transcribe
 
 
@@ -33,21 +34,27 @@ def _run(
     if not settings.input:
         raise RuntimeError("No input given. Set INPUT in .env or pass -i/--input.")
 
-    source_path = download_youtube(
-        settings.input,
-        fmt=settings.download_format,
-        out_dir=settings.output_dir,
-    )
+    # Time each stage so the CLI can show where the run spends its time.
+    timer = start_timer()
 
-    transcript = transcribe(source_path, settings)
+    with timer.stage("download"):
+        source_path = download_youtube(
+            settings.input,
+            fmt=settings.download_format,
+            out_dir=settings.output_dir,
+        )
+
+    with timer.stage("transcribe"):
+        transcript = transcribe(source_path, settings)
     if not transcript["segments"]:
         raise RuntimeError(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    highlights_result = get_highlights(
-        transcript, settings, num_clips=settings.num_clips
-    )
+    with timer.stage("highlights"):
+        highlights_result = get_highlights(
+            transcript, settings, num_clips=settings.num_clips
+        )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
@@ -60,24 +67,26 @@ def _run(
         flush=True,
     )
 
-    shorts = crop_highlights(
-        source_path,
-        top,
-        aspect_ratio=settings.aspect_ratio,
-        out_dir=settings.output_dir,
-        face_tracking=settings.face_tracking,
-    )
+    with timer.stage("crop"):
+        shorts = crop_highlights(
+            source_path,
+            top,
+            aspect_ratio=settings.aspect_ratio,
+            out_dir=settings.output_dir,
+            face_tracking=settings.face_tracking,
+        )
 
     # Optional post-processing: add background music and burned-in subtitles to
     # every rendered short (uses the built-in post-processing engine).
     if enhance:
-        enhance_shorts(
-            transcript,
-            shorts,
-            settings,
-            add_music=add_music,
-            burn_subtitles=burn_subtitles,
-        )
+        with timer.stage("enhance"):
+            enhance_shorts(
+                transcript,
+                shorts,
+                settings,
+                add_music=add_music,
+                burn_subtitles=burn_subtitles,
+            )
 
     return {
         "mode": "local",
@@ -85,6 +94,7 @@ def _run(
         "transcript": transcript,
         "highlights": all_highlights,
         "shorts": shorts,
+        "timings": timer.as_dict(),
     }
 
 
@@ -115,6 +125,7 @@ def generate_shorts(
           "transcript": {...},
           "highlights": [...],       # every candidate, ranked
           "shorts": [...],           # top `num_clips` with local clip paths
+          "timings": {...},          # per-stage wall-clock measurements
         }
     """
     return _run(
