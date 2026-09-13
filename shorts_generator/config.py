@@ -35,6 +35,9 @@ from typing import Any, Mapping, Optional
 VALID_SUBTITLE_POSITIONS = ("bottom", "top", "center", "custom")
 VALID_SUBTITLE_SOURCES = ("auto", "file", "whisper", "none")
 VALID_BANNER_POSITIONS = ("top", "bottom", "center")
+# Appearance animation of a subtitle cue. An empty value (the default) disables
+# the animation entirely.
+VALID_SUBTITLE_ANIMATIONS = ("fade", "slide", "pop")
 
 DEFAULT_TEXT_FORE_COLOR = "#FFFFFF"
 DEFAULT_STROKE_COLOR = "#000000"
@@ -177,6 +180,23 @@ def _as_choice(value: Any, key: str, default: str, choices: tuple[str, ...]) -> 
     return text
 
 
+def _as_subtitle_animation(value: Any, key: str) -> str:
+    """Resolve ``SUBTITLE_ANIMATION``.
+
+    An empty value disables the animation. The common "off" spellings are also
+    accepted for convenience; anything else must name a known animation.
+    """
+    text = _as_str(value, "").lower()
+    if text in ("", "none", "off", "false", "no"):
+        return ""
+    if text not in VALID_SUBTITLE_ANIMATIONS:
+        allowed = ", ".join(VALID_SUBTITLE_ANIMATIONS)
+        raise ConfigError(
+            f"{key} must be empty (no animation) or one of: {allowed}; got: {value!r}"
+        )
+    return text
+
+
 def parse_aspect_ratio(value: Any, default: float = 9.0 / 16.0) -> float:
     """Parse ``9:16`` (or ``9x16``) into a ``width / height`` float.
 
@@ -264,6 +284,22 @@ class Settings:
     stroke_width: float = 1.5
     subtitle_position: str = "bottom"
     custom_position: float = 70.0
+    # An appearance animation for each cue. Empty = disabled; otherwise
+    # ``fade`` | ``slide`` | ``pop``. ``subtitle_animation_duration`` is how
+    # long the entrance lasts, in seconds.
+    subtitle_animation: str = ""
+    subtitle_animation_duration: float = 0.25
+    # Cue chunking: a single on-screen phrase is split again when it exceeds any
+    # of these limits, so long sentences never hang over the whole screen.
+    subtitle_max_chars: int = 40
+    subtitle_max_words: int = 9
+    subtitle_max_duration: float = 3.5
+    # Shift every burned-in cue along the timeline, in seconds. Positive values
+    # make the text appear later, which compensates for Whisper word timings
+    # that tend to lead the actual speech by a fraction of a second; negative
+    # values make it appear earlier. Only the on-screen burn-in is shifted —
+    # the ``.srt`` cache keeps the raw transcript timings.
+    subtitle_offset: float = 0.0
 
     # Vertical fit / blurred background ------------------------------------
     # Force the rendered clip into a vertical frame. Videos that do not already
@@ -355,6 +391,8 @@ _INT_FIELDS = {
     "background_blur",
     "banner_margin",
     "banner_font_size",
+    "subtitle_max_chars",
+    "subtitle_max_words",
 }
 _FLOAT_FIELDS = {
     "music_volume",
@@ -365,6 +403,9 @@ _FLOAT_FIELDS = {
     "background_darken",
     "banner_width_ratio",
     "banner_opacity",
+    "subtitle_max_duration",
+    "subtitle_animation_duration",
+    "subtitle_offset",
 }
 
 
@@ -396,6 +437,8 @@ def _coerce(field_name: str, raw: Any, current: Any) -> Any:
         return _as_color(raw, key, DEFAULT_BANNER_BACKGROUND_COLOR)
     if field_name == "subtitle_position":
         return _as_choice(raw, key, str(current), VALID_SUBTITLE_POSITIONS)
+    if field_name == "subtitle_animation":
+        return _as_subtitle_animation(raw, key)
     if field_name == "subtitle_source":
         return _as_choice(raw, key, str(current), VALID_SUBTITLE_SOURCES)
     if field_name == "banner_position":
@@ -485,6 +528,19 @@ def _validate(settings: Settings) -> None:
         0 <= settings.custom_position <= 100
     ):
         raise ConfigError("CUSTOM_POSITION must be between 0 and 100")
+    if settings.subtitle_max_chars < 4:
+        raise ConfigError("SUBTITLE_MAX_CHARS must be at least 4")
+    if settings.subtitle_max_words < 1:
+        raise ConfigError("SUBTITLE_MAX_WORDS must be at least 1")
+    if settings.subtitle_max_duration <= 0:
+        raise ConfigError("SUBTITLE_MAX_DURATION must be greater than 0")
+    if settings.subtitle_animation_duration < 0:
+        raise ConfigError("SUBTITLE_ANIMATION_DURATION must be zero or greater")
+    if abs(settings.subtitle_offset) > 10:
+        raise ConfigError(
+            "SUBTITLE_OFFSET must be between -10 and 10 seconds "
+            f"(got {settings.subtitle_offset})"
+        )
     if settings.fps < 0:
         raise ConfigError("FPS must be zero (keep source) or a positive number")
     if settings.fit_height <= 0:

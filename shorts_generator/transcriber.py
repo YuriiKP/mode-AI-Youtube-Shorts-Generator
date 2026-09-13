@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .config import Settings
+from .cues import split_segments_into_cues
 
 
 def _transcript_cache_path(
@@ -100,6 +101,23 @@ def _load_srt_cache(cache_path: Path) -> Dict:
     return {"duration": duration, "segments": segments}
 
 
+def _apply_cue_split(transcript: Dict, settings: Settings) -> Dict:
+    """Re-chunk whole-sentence segments into short subtitle cues.
+
+    Whisper returns whole sentences per segment, which would otherwise be burned
+    in as one long block that hangs over the video. Splitting into short cues here
+    — using word-level timings when present — means the highlight ranking, the
+    ``.srt`` cache and the burned-in subtitles all share the same neat phrasing.
+    """
+    cues = split_segments_into_cues(
+        transcript.get("segments", []),
+        max_chars=settings.subtitle_max_chars,
+        max_words=settings.subtitle_max_words,
+        max_duration=settings.subtitle_max_duration,
+    )
+    return {"duration": transcript.get("duration", 0.0), "segments": cues}
+
+
 def _resolve_device(device: str) -> str:
     if device != "auto":
         return device
@@ -148,8 +166,9 @@ def transcribe(
                 )
                 srt_path.unlink(missing_ok=True)
             else:
+                cached = _apply_cue_split(cached, settings)
                 print(
-                    f"[transcribe] {len(cached['segments'])} cached segments, "
+                    f"[transcribe] {len(cached['segments'])} cached cues, "
                     f"{cached['duration']:.0f}s of audio",
                     flush=True,
                 )
@@ -179,6 +198,9 @@ def transcribe(
         "language": language,
         "beam_size": 5,
         "condition_on_previous_text": False,
+        # Word-level timings let the cue splitter follow the actual speech so
+        # each on-screen phrase appears and disappears in sync with the voice.
+        "word_timestamps": True,
     }
     if settings.whisper_vad_filter:
         transcribe_kwargs["vad_filter"] = True
@@ -189,21 +211,29 @@ def transcribe(
 
     segments = []
     for s in segments_iter:
-        segments.append(
-            {
-                "start": float(s.start),
-                "end": float(s.end),
-                "text": (s.text or "").strip(),
-            }
-        )
+        segment = {
+            "start": float(s.start),
+            "end": float(s.end),
+            "text": (s.text or "").strip(),
+        }
+        words = getattr(s, "words", None)
+        if words:
+            segment["words"] = [
+                {"start": float(w.start), "end": float(w.end), "word": (w.word or "")}
+                for w in words
+            ]
+        segments.append(segment)
 
     duration = float(getattr(info, "duration", 0.0)) or (
         segments[-1]["end"] if segments else 0.0
     )
-    print(
-        f"[transcribe] {len(segments)} segments, {duration:.0f}s of audio", flush=True
+    transcript = _apply_cue_split(
+        {"duration": duration, "segments": segments}, settings
     )
-    transcript = {"duration": duration, "segments": segments}
+    print(
+        f"[transcribe] {len(transcript['segments'])} cues, {duration:.0f}s of audio",
+        flush=True,
+    )
     srt_path = _write_srt_cache(media_path, transcript, settings, cache_path=cache_path)
     print(f"[transcribe] wrote cache: {srt_path}", flush=True)
     return transcript

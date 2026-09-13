@@ -19,9 +19,11 @@ from typing import List, Tuple
 
 import numpy as np
 from moviepy import CompositeVideoClip, ImageClip, TextClip
+from moviepy.video.fx import CrossFadeIn, Resize
 from PIL import Image, ImageDraw, ImageFont
 
 from ..config import Settings
+from ..cues import split_segments_into_cues
 from .log import log
 
 # A subtitle entry: ((start_seconds, end_seconds), text).
@@ -278,6 +280,74 @@ def _get_visible_center_position(
 # ---------------------------------------------------------------------------
 
 
+def _apply_appearance_animation(
+    clip,
+    base_x: float,
+    base_y: float,
+    settings: Settings,
+):
+    """Add a subtle entrance animation to an already-positioned subtitle clip.
+
+    The animation is chosen by ``SUBTITLE_ANIMATION`` (empty = disabled) and its
+    length by ``SUBTITLE_ANIMATION_DURATION``. It only plays at the very start of
+    the cue; afterwards the text stays put until it disappears, so nothing keeps
+    moving while the phrase is being read.
+
+    * ``fade``  — the cue simply fades in.
+    * ``slide`` — the cue fades in while rising into place from below.
+    * ``pop``   — the cue fades in while scaling up from 70% to 100%.
+
+    ``base_x``/``base_y`` are the resolved on-screen anchor of the clip so the
+    motion can be applied around it.
+    """
+    mode = (getattr(settings, "subtitle_animation", "") or "").lower()
+    if not mode:
+        return clip
+
+    duration = float(getattr(settings, "subtitle_animation_duration", 0.25) or 0.0)
+    if duration <= 0 or not clip.duration or clip.duration <= 0:
+        return clip
+    # Never let the entrance eat more than half of a short cue.
+    duration = min(duration, clip.duration / 2.0)
+
+    # Every mode fades the clip in; this works because the cue is composited on
+    # top of the video (see ``pipeline.run``). Slide/pop then add motion or
+    # scale on top of that fade.
+    clip = clip.with_effects([CrossFadeIn(duration)])
+
+    if mode == "slide":
+        distance = int(settings.font_size * 0.5)
+
+        def _slide_position(t):
+            progress = min(1.0, t / duration)
+            eased = 1 - (1 - progress) ** 3  # ease-out cubic
+            return (base_x, base_y + distance * (1 - eased))
+
+        clip = clip.with_position(_slide_position)
+
+    elif mode == "pop":
+        base_w, base_h = clip.size
+
+        def _scale(t):
+            progress = min(1.0, t / duration)
+            eased = 1 - (1 - progress) ** 3
+            return 0.7 + 0.3 * eased
+
+        clip = clip.with_effects([Resize(_scale)])
+
+        def _pop_position(t):
+            factor = _scale(t)
+            # Keep the box centred on the same point while it scales up.
+            return (
+                base_x + base_w / 2 - base_w * factor / 2,
+                base_y + base_h / 2 - base_h * factor / 2,
+            )
+
+        clip = clip.with_position(_pop_position)
+
+    return clip
+
+
 def create_text_clip(
     subtitle_item: SubtitleItem,
     settings: Settings,
@@ -404,20 +474,24 @@ def create_text_clip(
     clip = clip.with_end(end)
     clip = clip.with_duration(end - start)
 
+    # Resolve the position to concrete pixels so the entrance animation can
+    # offset/scale the cue around a fixed anchor point.
+    clip_w, clip_h = clip.size
+    base_x = int(round((video_width - clip_w) / 2))
     if settings.subtitle_position == "bottom":
-        clip = clip.with_position(("center", video_height * 0.95 - clip.h))
+        base_y = int(round(video_height * 0.95 - clip_h))
     elif settings.subtitle_position == "top":
-        clip = clip.with_position(("center", video_height * 0.05))
+        base_y = int(round(video_height * 0.05))
     elif settings.subtitle_position == "custom":
         margin = 10
-        max_y = video_height - clip.h - margin
-        custom_y = (video_height - clip.h) * (settings.custom_position / 100)
-        custom_y = max(margin, min(custom_y, max_y))
-        clip = clip.with_position(("center", custom_y))
+        max_y = video_height - clip_h - margin
+        custom_y = (video_height - clip_h) * (settings.custom_position / 100)
+        base_y = int(round(max(margin, min(custom_y, max_y))))
     else:  # center
-        clip = clip.with_position(("center", "center"))
+        base_y = int(round((video_height - clip_h) / 2))
 
-    return clip
+    clip = clip.with_position((base_x, base_y))
+    return _apply_appearance_animation(clip, base_x, base_y, settings)
 
 
 def build_subtitle_clips(
@@ -427,10 +501,37 @@ def build_subtitle_clips(
     video_height: int,
     font_path: str,
 ):
-    """Parse ``subtitle_path`` and return a list of positioned text clips."""
+    """Parse ``subtitle_path`` and return a list of positioned text clips.
+
+    Each subtitle entry is passed through the cue splitter first, so an ``.srt``
+    that still holds whole sentences (an old cache or a hand-made file) is broken
+    into short on-screen phrases instead of one long block. Entries that are
+    already short cues pass through unchanged.
+    """
     items = load_subtitles(subtitle_path)
+    cues = split_segments_into_cues(
+        [{"start": start, "end": end, "text": text} for (start, end), text in items],
+        max_chars=settings.subtitle_max_chars,
+        max_words=settings.subtitle_max_words,
+        max_duration=settings.subtitle_max_duration,
+    )
+
+    # Shift the whole cue along the timeline: ``SUBTITLE_OFFSET`` compensates
+    # for Whisper word timings that lead the actual speech, so a positive value
+    # makes the text appear later instead of a fraction of a second too early.
+    # Only the on-screen burn-in moves; the ``.srt`` cache keeps raw timings.
+    offset = float(getattr(settings, "subtitle_offset", 0.0) or 0.0)
+    if offset:
+        shifted = []
+        for cue in cues:
+            start = max(0.0, cue["start"] + offset)
+            end = max(start + 0.04, cue["end"] + offset)
+            shifted.append({"start": start, "end": end, "text": cue["text"]})
+        cues = shifted
+
     clips = []
-    for item in items:
+    for cue in cues:
+        item = ((cue["start"], cue["end"]), cue["text"])
         try:
             clips.append(
                 create_text_clip(
