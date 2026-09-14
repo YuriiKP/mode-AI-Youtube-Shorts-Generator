@@ -13,7 +13,7 @@ to the configured provider (OpenAI / DeepSeek / Gemini, selected by
 
 import json
 import re
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
 from .llm import call_llm
@@ -97,10 +97,30 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 - Для каждого хайлайта определи единственную лучшую "hook_sentence" — начальную фразу, которая заставит зрителя прекратить листать
 - Оптимальная длительность: 45-90 секунд. Короче (20-44с) — только для идеального самодостаточного однострочника. Длиннее (91-180с) — только когда сюжетной арке нужен полный контекст, чтобы сработать
 - Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным
+- Особое внимание уделяй КОНЦУ клипа (end_time): он обязан приходиться на ПОСЛЕДНЕЕ слово завершающей фразы, а не на её середину. Мысль должна успеть высказаться до конца
+- Перед выбором end_time мысленно дочитай завершающую фразу до её логической точки (конец предложения, вопроса, панчлайна) и включи её ЦЕЛИКОМ. Если после основного смысла идёт короткое завершение — вывод, ремарка, уточнение или панчлайн, — обязательно оставь его внутри клипа
+- Никогда не заканчивай клип на служебном слове (предлог, союз, вводное «и», «но», «потому что»): это верный признак обрезанной фразы. При сомнении сдвигай end_time на 1-2 слова ПОЗЖЕ, к ближайшей реальной границе предложения по таймкодам транскрипта, а не раньше
 - Клипы не должны существенно пересекаться друг с другом
 - Оценка 0-100 по виральному потенциалу (а не по общему качеству)
 - {num_clips_instruction}
 - Объясни одним предложением, почему этот клип виральный ("virality_reason")
+
+ПРОВЕРКА КОНЦА КЛИПА (обязательно делай её перед тем, как вернуть ответ):
+Фразы в транскрипте разбиты на короткие реплики, и одна мысль часто растягивается на несколько строк подряд. Поэтому выбрав момент, найди последнюю строку, попавшую в клип, и посмотри, ЧЕМ она заканчивается:
+- Если строка оканчивается на союзе, предлоге или вводном слове («и», «но», «а», «что», «чтобы», «потому что», «в», «на», «с», «к», «про» и т.п.) — фраза НЕ закончена. Продолжай сдвигать end_time по следующим строкам транскрипта, пока не дойдёшь до строки, которая завершается точкой, вопросительным или восклицательным знаком (или иной настоящей границей предложения). Эту завершающую строку включи целиком.
+- end_time должен совпадать со временем КОНЦА этой завершающей строки, а не с серединой фразы.
+
+Пример (как НЕ надо и как надо), транскрипт:
+  150  Патоген вызывает
+  151  мутацию плода,
+  152  обращая в
+  153  камень и
+  154  мать, и
+  155  ребенка.
+ПЛОХО: end_time стоит на конце строки 154 — «...обращая в камень и мать, и». Фраза обрывается на союзе «и», потеряно ключевое слово «ребенка», и смысл звучит неполно.
+ХОРОШО: end_time стоит на конце строки 155 — «...обращая в камень и мать, и ребенка». Мысль досказана до конца.
+
+Применяй это правило к концу КАЖДОГО клипа: клип не должен обрываться на незакрытой фразе только потому, что её остаток попал в следующую строку транскрипта.
 
 Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
 {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
@@ -326,6 +346,84 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
         if not overlapping:
             kept.append(h)
     return kept
+
+
+def snap_highlights_to_transcript(
+    highlights: List[Dict],
+    transcript: Dict,
+    *,
+    start_padding: float = 0.0,
+    end_padding: float = 0.0,
+    max_end: Optional[float] = None,
+) -> List[Dict]:
+    """Расширить границы хайлайтов до целых фраз транскрипта.
+
+    LLM выбирает ``start_time``/``end_time`` по тексту, поэтому граница часто
+    попадает в середину фразы — крайние слова обрезаются. Здесь окно каждого
+    хайлайта расширяется (но никогда не сужается) до границ перекрывающихся
+    кью: начало — до начала первого, конец — до конца последнего. Затем
+    добавляется запас ``start_padding``/``end_padding``; заход в соседнюю фразу
+    ограничивается, чтобы не подрезать следующую.
+
+    Изменённые границы пишутся прямо в словари ``highlights``, поэтому нарезка
+    и периклиповые субтитры используют их согласованно.
+    """
+    cues: List[Tuple[float, float]] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            cue_start = float(segment["start"])
+            cue_end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cue_end > cue_start:
+            cues.append((cue_start, cue_end))
+    cues.sort()
+
+    for highlight in highlights:
+        try:
+            start = float(highlight["start_time"])
+            end = float(highlight["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        overlapping = [c for c in cues if c[1] > start and c[0] < end]
+        if not overlapping:
+            continue
+        covered_start = min(c[0] for c in overlapping)
+        covered_end = max(c[1] for c in overlapping)
+
+        prev_end = next((c[1] for c in reversed(cues) if c[1] <= covered_start), None)
+        next_start = next((c[0] for c in cues if c[0] >= covered_end), None)
+
+        new_start = covered_start - start_padding
+        if prev_end is not None:
+            new_start = max(new_start, prev_end + 0.02)
+        new_start = max(0.0, min(new_start, covered_start))
+
+        new_end = covered_end + end_padding
+        if next_start is not None:
+            new_end = min(new_end, next_start - 0.02)
+        new_end = max(new_end, covered_end)
+        if max_end is not None:
+            new_end = min(new_end, max_end)
+
+        if new_end <= new_start:
+            new_end = new_start + 0.04
+
+        delta_start = new_start - start
+        delta_end = new_end - end
+        if abs(delta_start) > 1e-3 or abs(delta_end) > 1e-3:
+            print(
+                f"[highlights]   границы привязаны к фразам: "
+                f"[{start:.2f} → {end:.2f}] → [{new_start:.2f} → {new_end:.2f}] "
+                f"(начало {delta_start:+.2f} с, конец {delta_end:+.2f} с)",
+                flush=True,
+            )
+
+        highlight["start_time"] = round(new_start, 3)
+        highlight["end_time"] = round(new_end, 3)
+
+    return highlights
 
 
 def get_highlights(

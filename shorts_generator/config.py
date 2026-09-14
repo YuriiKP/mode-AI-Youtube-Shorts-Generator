@@ -248,6 +248,13 @@ class Settings:
     aspect_ratio: str = "9:16"
     download_format: str = "720"
     face_tracking: bool = True
+    # Границы хайлайта задаёт LLM и часто попадает в середину фразы. Если
+    # включено, границы сначала привязываются к фразам транскрипта
+    # (highlights.snap_highlights_to_transcript), затем добавляется запас,
+    # чтобы не обрезать крайние слова. Паддинги = 0 отключают запас.
+    clip_snap_to_transcript: bool = True
+    clip_start_padding: float = 0.15
+    clip_end_padding: float = 0.4
 
     # LLM (highlight ranking) ---------------------------------------------
     llm_provider: str = "openai"  # openai | deepseek | gemini
@@ -389,6 +396,7 @@ _BOOL_FIELDS = {
     "rounded_subtitle_background",
     "whisper_vad_filter",
     "fit_vertical",
+    "clip_snap_to_transcript",
 }
 _INT_FIELDS = {
     "num_clips",
@@ -414,6 +422,8 @@ _FLOAT_FIELDS = {
     "subtitle_pause_threshold",
     "subtitle_animation_duration",
     "subtitle_offset",
+    "clip_start_padding",
+    "clip_end_padding",
 }
 
 
@@ -524,6 +534,10 @@ def _validate(settings: Settings) -> None:
     """Sanity-check values that cannot be validated by type coercion alone."""
     if settings.num_clips <= 0:
         raise ConfigError("NUM_CLIPS must be a positive integer")
+    if settings.clip_start_padding < 0 or settings.clip_end_padding < 0:
+        raise ConfigError(
+            "CLIP_START_PADDING and CLIP_END_PADDING must be zero or greater"
+        )
     if settings.font_size <= 0:
         raise ConfigError("FONT_SIZE must be a positive integer")
     if settings.threads < 0:

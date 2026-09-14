@@ -19,7 +19,7 @@ from .clipper import crop_highlights
 from .config import Settings
 from .downloader import download_youtube
 from .enhance import enhance_shorts
-from .highlights import get_highlights
+from .highlights import get_highlights, snap_highlights_to_transcript
 from .subtitles import find_video_files
 from .timing import start_timer
 from .transcriber import transcribe
@@ -66,6 +66,15 @@ def _run(
         f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates",
         flush=True,
     )
+
+    if settings.clip_snap_to_transcript:
+        snap_highlights_to_transcript(
+            top,
+            transcript,
+            start_padding=settings.clip_start_padding,
+            end_padding=settings.clip_end_padding,
+            max_end=float(transcript.get("duration", 0.0)) or None,
+        )
 
     with timer.stage("crop"):
         shorts = crop_highlights(
