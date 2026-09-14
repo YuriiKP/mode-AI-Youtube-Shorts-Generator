@@ -263,7 +263,10 @@ class Settings:
     whisper_model: str = "base"
     whisper_device: str = "auto"  # auto | cpu | cuda
     whisper_language: str = ""
-    whisper_vad_filter: bool = False
+    # Silero VAD trims leading/trailing silence, which tightens the word
+    # timings Whisper reports and reduces subtitles that lead or lag the voice.
+    # Override with WHISPER_VAD_FILTER=false in .env to disable.
+    whisper_vad_filter: bool = True
 
     # Background music -----------------------------------------------------
     music: str = ""  # a file or a folder

@@ -386,7 +386,10 @@ def create_text_clip(
         txt_height + vertical_padding + (interline * line_count) + stroke_padding
     )
 
-    if rounded_bg_enabled:
+    # Measure the rendered text width so the background box can hug the text
+    # instead of stretching across the full available width.
+    text_w = int(max_width)
+    if has_subtitle_background:
         try:
             font = ImageFont.truetype(font_path, font_size)
             text_w = max(
@@ -399,8 +402,9 @@ def create_text_clip(
                 exc,
             )
             text_w = int(max_width)
+    box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
 
-        box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
+    if rounded_bg_enabled:
         radius = max(8, int(font_size * 0.4))
         text_clip = TextClip(
             text=wrapped_txt,
@@ -438,11 +442,11 @@ def create_text_clip(
             stroke_color=settings.stroke_color,
             stroke_width=stroke_width,
             interline=interline,
-            size=(int(max_width), None),
+            size=(box_w, None),
             text_align="center",
             margin=(0, text_clip_margin_y),
         )
-        size = (int(max_width), max(clip_h, text_clip.h))
+        size = (box_w, max(clip_h, text_clip.h))
         bg_clip = _rounded_subtitle_background_clip(
             width=size[0],
             height=size[1],
