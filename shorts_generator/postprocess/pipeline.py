@@ -2,14 +2,17 @@
 
 :func:`run` ties the stages together:
 
-1. resolve the subtitle source (an existing ``.srt`` next to the video, a given
+1. bake the configured colour/lens effects (``SATURATION`` / ``SHARPNESS`` /
+   ``CHROMATIC_ABERRATION``) into the source with a single FFmpeg pass, so they
+   land on the video *only* — before any text is drawn;
+2. resolve the subtitle source (an existing ``.srt`` next to the video, a given
    ``.srt``, or a Whisper transcription when none is found);
-2. re-frame the clip into the vertical frame, filling the empty area with a
+3. re-frame the clip into the vertical frame, filling the empty area with a
    blurred copy of the video when it does not already match the target ratio
    (``FIT_VERTICAL``);
-3. burn the subtitles and overlay the banner onto the video;
-4. mix a background music track under the existing audio;
-5. write the result to disk.
+4. burn the subtitles and overlay the banner onto the video;
+5. mix a background music track under the existing audio;
+6. write the result to disk.
 
 The input's own audio is always kept and the music is mixed *under* it, so an
 existing voice-over is never lost. Every stage is optional and independent —
@@ -34,7 +37,7 @@ from moviepy import (
 
 from ..config import Settings
 from .banner import banner_kind, build_banner_clips
-from .effects import apply_effects
+from .effects import build_filter_chain
 from .ffmpeg import configure_ffmpeg
 from .fonts import resolve_font_path
 from .layout import build_vertical_clip, needs_vertical_fit
@@ -43,6 +46,10 @@ from .music import build_music_audio, resolve_music_file
 from .subtitles import build_subtitle_clips
 
 _DEFAULT_VIDEO_CODEC = "libx264"
+
+# CRF for the effects pre-pass intermediate: high enough that the extra encode
+# generation is visually invisible, while still encoding quickly.
+_EFFECTS_CRF = "18"
 
 
 class ProcessingError(RuntimeError):
@@ -119,6 +126,67 @@ def _scrub_input(path: str, ffmpeg_binary: str) -> str:
         raise
 
     log.info("created a cleaned copy without chapters/extra streams")
+    return temp_path
+
+
+def _apply_effects_pass(source_path: str, filter_chain: str, ffmpeg_binary: str) -> str:
+    """Bake the colour/lens effects into ``source_path`` with one FFmpeg pass.
+
+    The effects must land on the video *only* — before MoviePy composites the
+    subtitles and the banner on top — so rather than filtering the final encode
+    we rewrite the source once here and hand the result to the rest of the
+    pipeline. FFmpeg runs the filters in optimised, multithreaded C, so this
+    stays far cheaper than touching every frame in Python. The intermediate is a
+    high-quality x264 copy, so the extra encode generation is visually lossless.
+
+    Returns the temporary file path; the caller must delete it when done. On
+    failure the temp file is removed and a :class:`ProcessingError` is raised.
+    """
+    handle, temp_path = tempfile.mkstemp(prefix="shorts_fx_", suffix=".mkv")
+    os.close(handle)
+    _remove_file(temp_path)
+
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        source_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-map_chapters",
+        "-1",
+        "-sn",
+        "-dn",
+        "-vf",
+        filter_chain,
+        "-c:v",
+        _DEFAULT_VIDEO_CODEC,
+        "-crf",
+        _EFFECTS_CRF,
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        temp_path,
+    ]
+    log.info("applying video filters to the source: %s", filter_chain)
+    try:
+        _ = subprocess.run(
+            cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+    except subprocess.CalledProcessError as exc:
+        _remove_file(temp_path)
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        raise ProcessingError(f"failed to apply video effects: {stderr}") from exc
+    except Exception:
+        _remove_file(temp_path)
+        raise
     return temp_path
 
 
@@ -379,7 +447,23 @@ def run(
         else ""
     )
 
-    video_clip, scrubbed_input = _open_video(source_path, ffmpeg_binary)
+    # --- colour / lens effects -------------------------------------------
+    # Baked into the source first, so they affect the video but never the text
+    # (subtitles/banner) that gets composited on top later. Skipped entirely
+    # when every effect is at its neutral value.
+    working_path = source_path
+    effects_input = ""
+    filter_chain = build_filter_chain(settings)
+    if filter_chain:
+        effects_input = _apply_effects_pass(source_path, filter_chain, ffmpeg_binary)
+        working_path = effects_input
+
+    try:
+        video_clip, scrubbed_input = _open_video(working_path, ffmpeg_binary)
+    except BaseException:
+        _remove_file(effects_input)
+        raise
+
     music_source = None
     try:
         width, height = video_clip.size
@@ -399,12 +483,6 @@ def run(
         if needs_vertical_fit(video_clip, settings):
             final_clip = build_vertical_clip(video_clip, settings)
             final_width, final_height = (int(value) for value in final_clip.size)
-
-        # --- colour / lens effects ---------------------------------------
-        # Applied to the video itself, before the overlays are composited, so
-        # the saturation/sharpness/aberration never soften the subtitle or
-        # banner text. A no-op (the clip is returned as-is) unless configured.
-        final_clip = apply_effects(final_clip, settings)
 
         # --- overlays: burned-in subtitles + banner ----------------------
         # The font is only needed when something textual is drawn (subtitles or
@@ -489,6 +567,7 @@ def run(
         if music_source is not None:
             _safe_close(music_source)
         _remove_file(scrubbed_input)
+        _remove_file(effects_input)
 
     log.info("done: %s", target_path)
     return target_path

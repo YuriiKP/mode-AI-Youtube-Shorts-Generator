@@ -1,219 +1,89 @@
-"""Configurable colour / lens effects applied to the rendered video frame.
+"""Configurable colour / lens effects, compiled into an FFmpeg filtergraph.
 
-Three independent, optional effects are exposed through the ``.env`` and are all
-implemented as a single NumPy/OpenCV per-frame pass (the same technique the
-vertical re-framer uses, so it slots into the existing pipeline and costs only
-one extra pass over the frame):
+Three independent, optional effects are exposed through the ``.env``:
 
 * ``SATURATION`` — a multiplier on colour saturation. ``1.0`` keeps the source
   colours untouched, ``0`` renders greyscale and values above ``1`` boost
   colour.
 * ``SHARPNESS`` — an unsharp-mask amount for edge enhancement. ``0`` disables
   it, ``1.0`` is a mild and ``2.0`` a fairly strong boost.
-* ``CHROMATIC_ABERRATION`` — the red and blue channels are scaled in opposite
-  directions, so colours fringe towards the corners like a real lens. The value
-  is the approximate channel separation, in pixels, at the corner of the frame;
-  ``0`` disables it.
+* ``CHROMATIC_ABERRATION`` — the red and blue channels are shifted in opposite
+  directions, so colours fringe at the edges of the frame. The value is the
+  channel separation, in pixels; ``0`` disables it.
 
-The effects are applied to the video *before* subtitles and the banner are drawn,
-so the text overlays stay crisp. When all three are at their neutral value the
-clip is returned untouched and not a single frame is processed.
+Where the effects run matters. Processing every frame in Python (NumPy/OpenCV
+through ``image_transform``) is **single-threaded**: it holds one core while the
+rest of the machine sits idle and starves the encoder, which is by far the
+slowest part of a render. So instead of touching frames here, the effects are
+compiled into an FFmpeg filtergraph string and applied in a dedicated pre-pass
+over the source video (see
+:func:`shorts_generator.postprocess.pipeline._apply_effects_pass`). FFmpeg then
+runs the very same filters in optimised, multi-threaded C — on every core — so
+enabling an effect costs a few milliseconds per frame instead of tens of them,
+and the per-frame Python cost is gone entirely.
+
+The graph uses only widely available filters (``eq`` / ``unsharp`` /
+``rgbashift``), so it works with any standard FFmpeg build. Because the pre-pass
+rewrites the source *before* anything is composited on top, the effects land on
+the video only — the subtitles and the banner are drawn afterwards and stay
+crisp. When all three values are neutral the graph is empty and the pre-pass is
+skipped entirely.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Any
-
 from ..config import Settings
-from .log import log
 
-# Rec. 601 luma weights (the classic greyscale filter uses the same ones). The
-# channel order matches MoviePy's frames, which are RGB.
-_LUMA_WEIGHTS = (0.299, 0.587, 0.114)
-
-# Standard deviation of the Gaussian used by the unsharp mask. A small sigma
-# sharpens fine detail without producing the wide halos a large sigma would.
-_SHARPEN_SIGMA = 1.5
-
-# Values closer than this to 1.0 are treated as "no saturation change" so a
-# default of ``1.0`` never triggers the effect.
+# Values closer than this to 1.0 count as "no saturation change", so the default
+# of ``1.0`` never contributes a filter.
 _SATURATION_EPSILON = 1e-6
 
 
-def _saturation_changes_picture(value: float) -> bool:
-    """Whether a saturation multiplier would actually alter the frame."""
-    return abs(value - 1.0) > _SATURATION_EPSILON
+def _fmt(value: float) -> str:
+    """Format a number for an FFmpeg option, without a needless trailing ``.0``.
+
+    ``1.0`` becomes ``"1"`` and ``1.25`` stays ``"1.25"`` — both of which FFmpeg
+    parses identically, but the shorter form keeps logged filtergraphs readable.
+    """
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def build_filter_chain(settings: Settings) -> str:
+    """Compile the configured effects into one FFmpeg filtergraph string.
+
+    Returns ``""`` when every effect is at its neutral value; callers must then
+    not add a video filter at all. Otherwise the result is a comma-separated
+    chain (e.g. ``"eq=saturation=1.2,unsharp=5:5:1:5:5:0,rgbashift=rh=3:bh=-3"``)
+    ready to hand to FFmpeg via ``-vf``.
+    """
+    filters: list[str] = []
+
+    saturation = float(settings.saturation)
+    if abs(saturation - 1.0) > _SATURATION_EPSILON:
+        # ``eq``'s saturation option uses the same convention as ours: 1.0 keeps
+        # the colours, 0 gives greyscale. Other eq knobs stay at their defaults.
+        filters.append(f"eq=saturation={_fmt(saturation)}")
+
+    sharpness = max(0.0, float(settings.sharpness))
+    if sharpness > 0.0:
+        # A 5x5 unsharp mask applied to luma only (chroma amount 0) so sharpening
+        # never introduces colour halos around edges.
+        filters.append(f"unsharp=5:5:{_fmt(sharpness)}:5:5:0")
+
+    aberration = max(0.0, float(settings.chromatic_aberration))
+    if aberration > 0.0:
+        # Shift the red channel one way and the blue the other by roughly this
+        # many pixels; at least one pixel, so a tiny config still has an effect.
+        shift = max(1, round(aberration))
+        filters.append(f"rgbashift=rh={shift}:bh=-{shift}")
+
+    return ",".join(filters)
 
 
 def effects_enabled(settings: Settings) -> bool:
     """Return ``True`` when at least one effect would change the picture."""
-    return (
-        _saturation_changes_picture(float(settings.saturation))
-        or float(settings.sharpness) > 0.0
-        or float(settings.chromatic_aberration) > 0.0
-    )
+    return bool(build_filter_chain(settings))
 
 
-def _to_uint8(frame: Any) -> tuple[Any, Any]:
-    """Coerce a frame to ``uint8`` for the OpenCV-backed effects.
-
-    Real MoviePy video frames are already ``uint8`` RGB and are returned
-    untouched. Anything else — a tiny integer or float test clip, for instance —
-    is scaled into the 0..255 range first; the original dtype is returned
-    alongside so :func:`_restore_dtype` can cast the processed frame back.
-    """
-    import numpy as np
-
-    if frame.dtype == np.uint8:
-        return frame, None
-    data = frame.astype(np.float32)
-    # Floats are often normalised to 0..1; bring them into the uint8 range first.
-    if frame.dtype.kind == "f" and (data.size == 0 or float(data.max()) <= 1.0):
-        data = data * 255.0
-    return np.clip(data, 0.0, 255.0).astype(np.uint8), frame.dtype
-
-
-def _restore_dtype(frame: Any, original_dtype: Any) -> Any:
-    """Cast a processed frame back to ``original_dtype`` (``None`` = unchanged)."""
-    if original_dtype is None:
-        return frame
-    return frame.astype(original_dtype)
-
-
-def _apply_saturation(frame: Any, factor: float) -> Any:
-    """Move every pixel towards (or away from) its luma.
-
-    ``factor`` scales the colour difference from the greyscale value: ``1.0``
-    leaves the frame alone, ``0`` collapses it to greyscale and values above
-    ``1`` extrapolate the colour outwards so it becomes more vivid. This is a
-    single vectorised NumPy pass — no HSV round-trip, so hues never shift.
-    """
-    import numpy as np
-
-    weights = np.array(_LUMA_WEIGHTS, dtype=np.float32)
-    data = frame.astype(np.float32)
-    luma = (data @ weights)[..., None]
-    return np.clip(luma + (data - luma) * factor, 0.0, 255.0).astype(frame.dtype)
-
-
-def _apply_sharpness(frame: Any, amount: float) -> Any:
-    """Sharpen the frame with an unsharp mask.
-
-    A lightly blurred copy is subtracted from the frame, and ``amount`` times
-    that difference is added back — the standard unsharp-mask trick. Larger
-    ``amount`` values push the edges further while the clamp keeps the result in
-    range.
-    """
-    import cv2
-    import numpy as np
-
-    work, original_dtype = _to_uint8(frame)
-    blurred = cv2.GaussianBlur(work, (0, 0), sigmaX=_SHARPEN_SIGMA)
-    data = work.astype(np.float32)
-    sharpened = data + (data - blurred.astype(np.float32)) * amount
-    result = np.clip(sharpened, 0.0, 255.0).astype(np.uint8)
-    return _restore_dtype(result, original_dtype)
-
-
-def _scale_channel(channel: Any, scale: float) -> Any:
-    """Scale a single-channel image about its centre by ``scale``.
-
-    ``scale`` slightly above ``1`` pushes pixels outwards from the centre and
-    below ``1`` pulls them inwards, which is exactly the radial displacement a
-    chromatic aberration needs. Edge pixels are replicated so the corners do not
-    smear to black.
-    """
-    import cv2
-
-    height, width = channel.shape[:2]
-    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), 0.0, scale)
-    return cv2.warpAffine(
-        channel,
-        matrix,
-        (width, height),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-
-
-def _apply_chromatic_aberration(frame: Any, pixels: float) -> Any:
-    """Fringe the colours by scaling the red and blue channels apart.
-
-    ``pixels`` is the approximate red/blue separation at the corner of the
-    frame: the red channel is scaled outwards and the blue inwards by that many
-    pixels there (the shift tapers off to zero at the centre). The green
-    channel — which carries most of the perceived detail — is left untouched.
-    """
-    import numpy as np
-
-    work, original_dtype = _to_uint8(frame)
-    height, width = work.shape[:2]
-    # Half the frame diagonal, i.e. the distance from the centre to a corner.
-    radius = max(1.0, math.hypot(width, height) / 2.0)
-    delta = pixels / radius
-
-    red = _scale_channel(work[..., 0], 1.0 + delta)
-    green = work[..., 1]
-    blue = _scale_channel(work[..., 2], 1.0 - delta)
-    result = np.stack((red, green, blue), axis=-1)
-    return _restore_dtype(result, original_dtype)
-
-
-def apply_effects(clip: Any, settings: Settings) -> Any:
-    """Return ``clip`` with the configured colour/lens effects applied.
-
-    The effects are chained as a single :meth:`~moviepy.VideoClip.image_transform`
-    pass so the encode stays one re-encode. When every effect is at its neutral
-    value the clip is returned unchanged and no frames are processed.
-    """
-    saturation = float(settings.saturation)
-    sharpness = max(0.0, float(settings.sharpness))
-    aberration = max(0.0, float(settings.chromatic_aberration))
-
-    if not effects_enabled(settings):
-        return clip
-
-    # Saturation is pure NumPy, but sharpening and the aberration need OpenCV.
-    # If it is missing, keep whatever still works instead of dropping everything.
-    if sharpness > 0.0 or aberration > 0.0:
-        try:
-            import cv2  # noqa: F401
-        except Exception as exc:  # pragma: no cover - OpenCV is a hard dependency
-            log.warning(
-                "OpenCV unavailable (%s); skipping sharpness and chromatic aberration",
-                exc,
-            )
-            sharpness = 0.0
-            aberration = 0.0
-
-    if not (
-        _saturation_changes_picture(saturation) or sharpness > 0.0 or aberration > 0.0
-    ):
-        return clip
-
-    log.info(
-        "applying video effects (saturation=%.2f, sharpness=%.2f, "
-        "chromatic_aberration=%.1fpx)",
-        saturation,
-        sharpness,
-        aberration,
-    )
-
-    def transform(frame: Any) -> Any:
-        # OpenCV needs an 8-bit buffer; real video frames already are uint8, but
-        # cast (and later restore) so odd dtypes from other readers still work.
-        work, original_dtype = _to_uint8(frame)
-        result = work
-        if _saturation_changes_picture(saturation):
-            result = _apply_saturation(result, saturation)
-        if sharpness > 0.0:
-            result = _apply_sharpness(result, sharpness)
-        if aberration > 0.0:
-            result = _apply_chromatic_aberration(result, aberration)
-        return _restore_dtype(result, original_dtype)
-
-    return clip.image_transform(transform)
-
-
-__all__: list[str] = ["apply_effects", "effects_enabled"]
+__all__: list[str] = ["build_filter_chain", "effects_enabled"]
