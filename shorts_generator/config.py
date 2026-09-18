@@ -338,6 +338,18 @@ class Settings:
     banner_text_color: str = DEFAULT_BANNER_TEXT_COLOR
     banner_background_color: str = DEFAULT_BANNER_BACKGROUND_COLOR
 
+    # Colour / lens effects ------------------------------------------------
+    # A saturation multiplier applied to the video before subtitles and the
+    # banner are drawn: ``1.0`` keeps the source colours untouched, ``0``
+    # renders greyscale and values above ``1`` boost colour.
+    saturation: float = 1.0
+    # Unsharp-mask amount for edge sharpening: ``0`` disables it, ``1.0`` is a
+    # mild and ``2.0`` a fairly strong boost.
+    sharpness: float = 0.0
+    # Chromatic aberration strength, expressed as the approximate red/blue
+    # channel separation in pixels at the corner of the frame; ``0`` disables it.
+    chromatic_aberration: float = 0.0
+
     # Encoding -------------------------------------------------------------
     video_codec: str = "libx264"
     audio_codec: str = "aac"
@@ -424,6 +436,9 @@ _FLOAT_FIELDS = {
     "subtitle_offset",
     "clip_start_padding",
     "clip_end_padding",
+    "saturation",
+    "sharpness",
+    "chromatic_aberration",
 }
 
 
@@ -584,6 +599,12 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("BANNER_WIDTH_RATIO must be between 0 and 1")
     if not 0.0 <= settings.banner_opacity <= 1.0:
         raise ConfigError("BANNER_OPACITY must be between 0 and 1")
+    if settings.saturation < 0:
+        raise ConfigError("SATURATION must be zero or greater")
+    if settings.sharpness < 0:
+        raise ConfigError("SHARPNESS must be zero or greater")
+    if settings.chromatic_aberration < 0:
+        raise ConfigError("CHROMATIC_ABERRATION must be zero or greater")
 
 
 # ---------------------------------------------------------------------------

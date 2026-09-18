@@ -214,6 +214,32 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="where to place the banner (default: top)",
     )
+    parser.add_argument(
+        "--saturation",
+        dest="saturation",
+        type=float,
+        default=None,
+        metavar="N",
+        help="saturation multiplier: 1.0 keeps the colours, 0 is greyscale and "
+        "values above 1 boost colour (default: 1.0)",
+    )
+    parser.add_argument(
+        "--sharpness",
+        dest="sharpness",
+        type=float,
+        default=None,
+        metavar="N",
+        help="unsharp-mask strength, 0 disables the sharpening (default: 0)",
+    )
+    parser.add_argument(
+        "--chromatic-aberration",
+        dest="chromatic_aberration",
+        type=float,
+        default=None,
+        metavar="PX",
+        help="red/blue channel separation in pixels at the frame corner, "
+        "0 disables the effect (default: 0)",
+    )
 
 
 def _add_json(parser: argparse.ArgumentParser) -> None:

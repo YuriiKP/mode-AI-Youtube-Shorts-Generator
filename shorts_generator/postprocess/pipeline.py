@@ -34,6 +34,7 @@ from moviepy import (
 
 from ..config import Settings
 from .banner import banner_kind, build_banner_clips
+from .effects import apply_effects
 from .ffmpeg import configure_ffmpeg
 from .fonts import resolve_font_path
 from .layout import build_vertical_clip, needs_vertical_fit
@@ -398,6 +399,12 @@ def run(
         if needs_vertical_fit(video_clip, settings):
             final_clip = build_vertical_clip(video_clip, settings)
             final_width, final_height = (int(value) for value in final_clip.size)
+
+        # --- colour / lens effects ---------------------------------------
+        # Applied to the video itself, before the overlays are composited, so
+        # the saturation/sharpness/aberration never soften the subtitle or
+        # banner text. A no-op (the clip is returned as-is) unless configured.
+        final_clip = apply_effects(final_clip, settings)
 
         # --- overlays: burned-in subtitles + banner ----------------------
         # The font is only needed when something textual is drawn (subtitles or
