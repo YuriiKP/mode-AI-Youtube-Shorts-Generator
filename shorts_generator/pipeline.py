@@ -25,30 +25,22 @@ from .timing import start_timer
 from .transcriber import transcribe
 
 
-def _run(
+def _process_one(
+    source_path: str,
     settings: Settings,
-    enhance: bool = False,
-    add_music: bool = True,
-    burn_subtitles: bool = True,
+    timer,
+    *,
+    enhance: bool,
+    add_music: bool,
+    burn_subtitles: bool,
 ) -> Dict:
-    if not settings.input:
-        raise RuntimeError("No input given. Set INPUT in .env or pass -i/--input.")
-
-    # Time each stage so the CLI can show where the run spends its time.
-    timer = start_timer()
-
-    with timer.stage("download"):
-        source_path = download_youtube(
-            settings.input,
-            fmt=settings.download_format,
-            out_dir=settings.output_dir,
-        )
-
+    """Run transcribe -> highlights -> crop (-> enhance) for one local video."""
     with timer.stage("transcribe"):
         transcript = transcribe(source_path, settings)
     if not transcript["segments"]:
         raise RuntimeError(
-            "Whisper produced no segments. The video may have no detectable speech."
+            "Whisper produced no segments; the video may have no detectable "
+            f"speech: {os.path.basename(source_path)}"
         )
 
     with timer.stage("highlights"):
@@ -57,7 +49,10 @@ def _run(
         )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
-        raise RuntimeError("Highlight generator returned zero clips.")
+        raise RuntimeError(
+            f"Highlight generator returned zero clips for "
+            f"{os.path.basename(source_path)}."
+        )
 
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[
         : settings.num_clips
@@ -85,8 +80,6 @@ def _run(
             face_tracking=settings.face_tracking,
         )
 
-    # Optional post-processing: add background music and burned-in subtitles to
-    # every rendered short (uses the built-in post-processing engine).
     if enhance:
         with timer.stage("enhance"):
             enhance_shorts(
@@ -98,11 +91,55 @@ def _run(
             )
 
     return {
-        "mode": "local",
         "source_video_url": source_path,
         "transcript": transcript,
         "highlights": all_highlights,
         "shorts": shorts,
+    }
+
+
+def _run(
+    settings: Settings,
+    enhance: bool = False,
+    add_music: bool = True,
+    burn_subtitles: bool = True,
+) -> Dict:
+    if not settings.input:
+        raise RuntimeError("No input given. Set INPUT in .env or pass -i/--input.")
+
+    # Time each stage so the CLI can show where the run spends its time.
+    timer = start_timer()
+
+    # INPUT may be a YouTube URL, a single file or a folder of videos; turn it
+    # into the list of local paths to process (downloading a URL first).
+    with timer.stage("download"):
+        source_paths = resolve_input_videos(settings)
+
+    videos: List[Dict] = []
+    for source_path in source_paths:
+        if len(source_paths) > 1:
+            print(f"[pipeline] video: {os.path.basename(source_path)}", flush=True)
+        videos.append(
+            _process_one(
+                source_path,
+                settings,
+                timer,
+                enhance=enhance,
+                add_music=add_music,
+                burn_subtitles=burn_subtitles,
+            )
+        )
+
+    single = len(videos) == 1
+    return {
+        "mode": "local",
+        "source_video_url": (
+            videos[0]["source_video_url"] if single else list(source_paths)
+        ),
+        "transcript": videos[0]["transcript"] if single else None,
+        "highlights": [h for v in videos for h in v["highlights"]],
+        "shorts": [s for v in videos for s in v["shorts"]],
+        "videos": videos,
         "timings": timer.as_dict(),
     }
 
@@ -115,6 +152,9 @@ def generate_shorts(
     burn_subtitles: bool = True,
 ) -> Dict:
     """Run the full clipping pipeline and return a structured result.
+
+    ``settings.input`` may be a YouTube URL, a single file, or a folder of
+    videos; each source video is processed in turn and the results are merged.
 
     Args:
         settings: resolved configuration (source, output dir, clipping options,
@@ -130,11 +170,16 @@ def generate_shorts(
     Returns:
         {
           "mode": "local",
-          "source_video_url": str,   # local path to the source video
-          "transcript": {...},
-          "highlights": [...],       # every candidate, ranked
-          "shorts": [...],           # top `num_clips` with local clip paths
-          "timings": {...},          # per-stage wall-clock measurements
+          "source_video_url": str | list[str],  # one path, or all inputs
+          "transcript": {...} | None,           # single input only
+          "highlights": [...],   # every candidate, merged across videos
+          "shorts": [...],       # top `num_clips` per video, with clip paths
+          "videos": [            # per-source breakdown (always present)
+            {"source_video_url": str, "transcript": {...},
+             "highlights": [...], "shorts": [...]},
+            ...
+          ],
+          "timings": {...},      # per-stage wall-clock measurements
         }
     """
     return _run(

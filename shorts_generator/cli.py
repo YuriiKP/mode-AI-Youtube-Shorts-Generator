@@ -378,36 +378,52 @@ def _maybe_write_json(path: Optional[str], payload: Dict) -> None:
 
 
 def _print_shorts(result: Dict, enhanced: bool) -> None:
+    videos = result.get("videos") or [result]
+    total_highlights = sum(len(video.get("highlights") or []) for video in videos)
+    total_shorts = sum(len(video.get("shorts") or []) for video in videos)
+
     print("\n" + "=" * 72)
-    print(f"Source video:  {result['source_video_url']}")
-    print(
-        f"Highlights:    {len(result['highlights'])} candidates"
-        f" -> kept top {len(result['shorts'])}"
-    )
+    if len(videos) == 1:
+        print(f"Source video:  {videos[0].get('source_video_url')}")
+    else:
+        print(f"Source videos: {len(videos)}")
+        for video in videos:
+            print(f"  - {video.get('source_video_url')}")
+    print(f"Highlights:    {total_highlights} candidates -> kept top {total_shorts}")
     print("=" * 72)
-    for i, short in enumerate(result["shorts"], 1):
-        ctype = short.get("clip_type") or "other"
-        start = short.get("start_time", 0.0)
-        end = short.get("end_time", 0.0)
-        print(
-            f"\n#{i}  score={short.get('score')}  [{ctype}]  {start:.1f}s -> {end:.1f}s"
-        )
-        print(f"     title:  {short.get('title')}")
-        if short.get("hook_sentence"):
-            print(f"     hook:   {short['hook_sentence']}")
-        if short.get("punchline"):
-            print(f"     punch:  {short['punchline']}")
-        if short.get("clip_url"):
-            print(f"     clip:   {short['clip_url']}")
-        else:
-            print(f"     clip:   FAILED ({short.get('error')})")
-        if enhanced:
-            if short.get("enhanced"):
-                print("     enhance: yes")
-                if short.get("subtitle_path"):
-                    print(f"     srt:    {short['subtitle_path']}")
-            elif short.get("enhance_error"):
-                print(f"     enhance: FAILED ({short['enhance_error']})")
+
+    index = 0
+    for video in videos:
+        shorts = video.get("shorts") or []
+        if len(videos) > 1:
+            print(f"\n=== {video.get('source_video_url')} ===")
+        if not shorts:
+            print("(no shorts rendered)")
+            continue
+        for short in shorts:
+            index += 1
+            ctype = short.get("clip_type") or "other"
+            start = short.get("start_time", 0.0)
+            end = short.get("end_time", 0.0)
+            print(
+                f"\n#{index}  score={short.get('score')}  [{ctype}]  {start:.1f}s -> {end:.1f}s"
+            )
+            print(f"     title:  {short.get('title')}")
+            if short.get("hook_sentence"):
+                print(f"     hook:   {short['hook_sentence']}")
+            if short.get("punchline"):
+                print(f"     punch:  {short['punchline']}")
+            if short.get("clip_url"):
+                print(f"     clip:   {short['clip_url']}")
+            else:
+                print(f"     clip:   FAILED ({short.get('error')})")
+            if enhanced:
+                if short.get("enhanced"):
+                    print("     enhance: yes")
+                    if short.get("subtitle_path"):
+                        print(f"     srt:    {short['subtitle_path']}")
+                elif short.get("enhance_error"):
+                    print(f"     enhance: FAILED ({short['enhance_error']})")
 
 
 def _print_timing() -> None:
