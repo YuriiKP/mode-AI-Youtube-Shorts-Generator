@@ -408,15 +408,17 @@ def _write_shorts_info(result: Dict, output_dir: str) -> Optional[str]:
     """
     videos = result.get("videos") or [result]
     blocks: List[str] = []
-    index = 0
+    total = 0
     for video in videos:
         shorts = video.get("shorts") or []
         if not shorts:
             continue
         source = video.get("source_video_url") or result.get("source_video_url")
         lines = [f"Источник: {os.path.basename(str(source))}", ""]
+        index = 0
         for short in shorts:
             index += 1
+            total += 1
             lines.append(f"#{index}")
             lines.append(f"Название:    {short.get('title') or '(без названия)'}")
             lines.append(f"Описание:    {short.get('description') or '(без описания)'}")
@@ -426,7 +428,7 @@ def _write_shorts_info(result: Dict, output_dir: str) -> Optional[str]:
             lines.append("")
         blocks.append("\n".join(lines).rstrip())
 
-    if index == 0:
+    if total == 0:
         return None
 
     header = "Информация о шортсах (для заполнения на площадках)"
