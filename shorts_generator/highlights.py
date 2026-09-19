@@ -58,9 +58,10 @@ LLMFn = Callable[[str], str]
 # - {num_clips_instruction}
 # - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
 # - Explain in one sentence why this clip is viral ("virality_reason")
+# - Write a short "description" of 1-2 sentences for posting on platforms (YouTube Shorts, TikTok, Instagram Reels); no hashtags, emoji or markdown
 #
 # Respond ONLY with valid JSON (no markdown, no explanation):
-# {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+# {{"highlights":[{{"title":"string","description":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
 
 
 # --- Russian prompts ---
@@ -105,6 +106,7 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 - Оценка 0-100 по виральному потенциалу (а не по общему качеству)
 - {num_clips_instruction}
 - Объясни одним предложением, почему этот клип виральный ("virality_reason")
+- Дай "description" — короткое описание клипа на 1-2 предложения для заполнения при публикации на площадках (YouTube Shorts, TikTok, Instagram Reels). Пиши цепляюще и по сути, как подпись к видео, без хэштегов, эмодзи и markdown
 
 ПРОВЕРКА КОНЦА КЛИПА (обязательно делай её перед тем, как вернуть ответ):
 Фразы в транскрипте разбиты на короткие реплики, и одна мысль часто растягивается на несколько строк подряд. Поэтому выбрав момент, найди последнюю строку, попавшую в клип, и посмотри, ЧЕМ она заканчивается:
@@ -124,7 +126,7 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 Применяй это правило к концу КАЖДОГО клипа: клип не должен обрываться на незакрытой фразе только потому, что её остаток попал в следующую строку транскрипта.
 
 Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+{{"highlights":[{{"title":"string","description":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200  # 20-min chunks for long videos
@@ -196,6 +198,7 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
         cleaned.append(
             {
                 "title": str(item.get("title") or "Untitled Highlight").strip(),
+                "description": str(item.get("description") or "").strip(),
                 "clip_type": str(item.get("clip_type") or "").strip().lower(),
                 "start_time": start,
                 "end_time": end,
@@ -318,7 +321,7 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nВАЖНО: верни ТОЛЬКО валидный JSON с массивом 'highlights' верхнего уровня."
-                + " Каждый элемент обязан содержать: clip_type, title, start_time, end_time, score,"
+                + " Каждый элемент обязан содержать: clip_type, title, description, start_time, end_time, score,"
                 + " laugh_score, cringe_score, intrigue_score, hook_sentence, punchline, virality_reason."
                 + " Без markdown-ограждений, без комментариев."
             )
