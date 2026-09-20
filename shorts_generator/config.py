@@ -41,6 +41,7 @@ VALID_SUBTITLE_ANIMATIONS = ("fade", "slide", "pop")
 
 DEFAULT_TEXT_FORE_COLOR = "#FFFFFF"
 DEFAULT_STROKE_COLOR = "#000000"
+DEFAULT_SHADOW_COLOR = "#000000"
 DEFAULT_BANNER_TEXT_COLOR = "#FFFFFF"
 DEFAULT_BANNER_BACKGROUND_COLOR = "#000000"
 
@@ -256,6 +257,18 @@ class Settings:
     clip_start_padding: float = 0.15
     clip_end_padding: float = 0.4
 
+    # Скольжение по кадру между переходами (монтажный эффект на этапе нарезки)
+    # ----------------------------------------------------------------
+    # Когда включено, окно вертикального кропа плавно едет по широкому
+    # исходному кадру — вправо, затем влево, поочерёдно на каждом переходе
+    # (склейке/фейде) внутри клипа. Так как края кадра обрезаются, скольжение
+    # показывает скрытые части картинки и добавляет движения. Применяется на
+    # самом первом шаге (нарезка/кроп), до цветовых эффектов и субтитров.
+    slide_effect: bool = False
+    # Переходы, отстоящие друг от друга ближе, чем это значение (в секундах),
+    # объединяются в одну группу: скольжение идёт сразу через всю группу.
+    slide_transition_gap: float = 3.0
+
     # LLM (highlight ranking) ---------------------------------------------
     llm_provider: str = "openai"  # openai | deepseek | gemini
     openai_api_key: str = ""
@@ -292,6 +305,19 @@ class Settings:
     rounded_subtitle_background: bool = False
     stroke_color: str = DEFAULT_STROKE_COLOR
     stroke_width: float = 1.5
+    # Drop shadow drawn behind the subtitle text. Disabled by default; when on,
+    # a solid copy of the text in ``subtitle_shadow_color`` is offset by
+    # ``subtitle_shadow_offset_x``/``_y`` pixels and composited behind the
+    # letters (on top of the background box, if any). ``subtitle_shadow_opacity``
+    # is the shadow's alpha, from fully transparent (0) to solid (1).
+    subtitle_shadow: bool = False
+    subtitle_shadow_color: str = DEFAULT_SHADOW_COLOR
+    subtitle_shadow_offset_x: int = 3
+    subtitle_shadow_offset_y: int = 3
+    subtitle_shadow_opacity: float = 0.6
+    # Gaussian blur applied to the shadow silhouette, in pixels (0 disables it).
+    # Larger values give a softer, more diffuse shadow.
+    subtitle_shadow_blur: float = 0.0
     subtitle_position: str = "bottom"
     custom_position: float = 70.0
     # An appearance animation for each cue. Empty = disabled; otherwise
@@ -406,9 +432,11 @@ _STR_FIELDS = {
 _BOOL_FIELDS = {
     "face_tracking",
     "rounded_subtitle_background",
+    "subtitle_shadow",
     "whisper_vad_filter",
     "fit_vertical",
     "clip_snap_to_transcript",
+    "slide_effect",
 }
 _INT_FIELDS = {
     "num_clips",
@@ -420,11 +448,15 @@ _INT_FIELDS = {
     "banner_font_size",
     "subtitle_max_chars",
     "subtitle_max_words",
+    "subtitle_shadow_offset_x",
+    "subtitle_shadow_offset_y",
 }
 _FLOAT_FIELDS = {
     "music_volume",
     "music_fade_out",
     "stroke_width",
+    "subtitle_shadow_opacity",
+    "subtitle_shadow_blur",
     "custom_position",
     "fps",
     "background_darken",
@@ -439,6 +471,7 @@ _FLOAT_FIELDS = {
     "saturation",
     "sharpness",
     "chromatic_aberration",
+    "slide_transition_gap",
 }
 
 
@@ -462,6 +495,8 @@ def _coerce(field_name: str, raw: Any, current: Any) -> Any:
         return _as_color(raw, key, DEFAULT_TEXT_FORE_COLOR)
     if field_name == "stroke_color":
         return _as_color(raw, key, DEFAULT_STROKE_COLOR)
+    if field_name == "subtitle_shadow_color":
+        return _as_color(raw, key, DEFAULT_SHADOW_COLOR)
     if field_name == "text_background_color":
         return _as_background_color(raw, key)
     if field_name == "banner_text_color":
@@ -553,6 +588,8 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(
             "CLIP_START_PADDING and CLIP_END_PADDING must be zero or greater"
         )
+    if settings.slide_transition_gap < 0:
+        raise ConfigError("SLIDE_TRANSITION_GAP must be zero or greater")
     if settings.font_size <= 0:
         raise ConfigError("FONT_SIZE must be a positive integer")
     if settings.threads < 0:
@@ -561,6 +598,10 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("MUSIC_VOLUME must be zero or greater")
     if settings.stroke_width < 0:
         raise ConfigError("STROKE_WIDTH must be zero or greater")
+    if not 0.0 <= settings.subtitle_shadow_opacity <= 1.0:
+        raise ConfigError("SUBTITLE_SHADOW_OPACITY must be between 0 and 1")
+    if settings.subtitle_shadow_blur < 0:
+        raise ConfigError("SUBTITLE_SHADOW_BLUR must be zero or greater")
     if settings.subtitle_position == "custom" and not (
         0 <= settings.custom_position <= 100
     ):

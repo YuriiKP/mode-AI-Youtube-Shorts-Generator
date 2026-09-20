@@ -4,12 +4,21 @@ Two stages per highlight:
   1. Cut the source video to [start, end] with ffmpeg (re-encoded, audio kept).
   2. Reframe the cut to the target aspect ratio. For 9:16 we slide a vertical
      window horizontally across the frame to keep faces centred (Haar
-     cascade — same approach as the original repo, no external models).
+     cascade — same approach as the original repo, no external models). When
+     SLIDE_EFFECT is enabled the window instead pans left/right between the
+     scene transitions detected inside the clip (see scene_transitions.py),
+     alternating the direction at every transition.
 """
 
 import os
 import subprocess
 from typing import Dict, List, Optional, Tuple
+
+from .scene_transitions import (
+    build_slide_segments,
+    detect_transitions,
+    slide_progress,
+)
 
 # Default output folder, used only when the caller does not pass one.
 DEFAULT_OUTPUT_DIR = "output"
@@ -65,7 +74,12 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
 
 
 def _reframe_vertical(
-    in_path: str, out_path: str, aspect_ratio: str, face_tracking: bool = True
+    in_path: str,
+    out_path: str,
+    aspect_ratio: str,
+    face_tracking: bool = True,
+    slide_effect: bool = False,
+    slide_gap: float = 3.0,
 ) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -123,6 +137,28 @@ def _reframe_vertical(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
 
+    # --- optional slide between scene transitions -------------------------
+    # Detect the cuts inside the cut clip and build a plan that slowly pans the
+    # crop window from one side of the wide frame to the other, alternating the
+    # direction at every (grouped) transition.
+    max_x0 = max(0, src_w - crop_w)
+    slide_segments = []
+    if slide_effect and max_x0 > 0:
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        duration = (frame_count / fps) if fps else 0.0
+        try:
+            transitions = detect_transitions(in_path)
+        except Exception as exc:
+            print(f"[clip] transition detection failed: {exc}", flush=True)
+            transitions = []
+        slide_segments = build_slide_segments(transitions, duration, gap=slide_gap)
+        print(
+            f"[clip] slide effect: {len(transitions)} transition(s) -> "
+            f"{len(slide_segments)} slide segment(s)",
+            flush=True,
+        )
+
+    frame_index = 0
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.15  # how aggressively to chase a new face position
     while True:
@@ -152,10 +188,18 @@ def _reframe_vertical(
             last_center = (src_w // 2, src_h // 2)
 
         cx, cy = last_center
-        x0 = max(0, min(src_w - crop_w, cx - crop_w // 2))
         y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+
+        if slide_segments:
+            progress = slide_progress(frame_index / fps if fps else 0.0, slide_segments)
+            x0 = int(round(progress * max_x0))
+            x0 = max(0, min(max_x0, x0))
+        else:
+            x0 = max(0, min(max_x0, cx - crop_w // 2))
+
         cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
         writer.write(cropped)
+        frame_index += 1
 
     cap.release()
     writer.release()
@@ -199,12 +243,21 @@ def crop_clip(
     aspect_ratio: str,
     out_path: str,
     face_tracking: bool = True,
+    slide_effect: bool = False,
+    slide_gap: float = 3.0,
 ) -> str:
     """Cut + reframe one highlight, returning the mp4 path."""
     cut_path = out_path + ".cut.mp4"
     try:
         _cut_subclip(source_path, start_time, end_time, cut_path)
-        _reframe_vertical(cut_path, out_path, aspect_ratio, face_tracking=face_tracking)
+        _reframe_vertical(
+            cut_path,
+            out_path,
+            aspect_ratio,
+            face_tracking=face_tracking,
+            slide_effect=slide_effect,
+            slide_gap=slide_gap,
+        )
     finally:
         if os.path.exists(cut_path):
             os.remove(cut_path)
@@ -217,6 +270,8 @@ def crop_highlights(
     aspect_ratio: str = "9:16",
     out_dir: Optional[str] = None,
     face_tracking: bool = True,
+    slide_effect: bool = False,
+    slide_gap: float = 3.0,
 ) -> List[Dict]:
     out_dir = out_dir or DEFAULT_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -238,6 +293,8 @@ def crop_highlights(
                 aspect_ratio,
                 out_path,
                 face_tracking=face_tracking,
+                slide_effect=slide_effect,
+                slide_gap=slide_gap,
             )
             results.append({**h, "clip_url": out_path})
         except Exception as e:

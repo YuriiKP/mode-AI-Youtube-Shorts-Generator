@@ -78,6 +78,8 @@ def _process_one(
             aspect_ratio=settings.aspect_ratio,
             out_dir=settings.output_dir,
             face_tracking=settings.face_tracking,
+            slide_effect=settings.slide_effect,
+            slide_gap=settings.slide_transition_gap,
         )
 
     if enhance:

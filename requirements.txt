@@ -11,3 +11,7 @@ opencv-python==4.8
 moviepy==2.2.1
 Pillow>=10.0
 numpy>=1.25
+
+# Scene/transition detection for the SLIDE_EFFECT pan (optional at runtime:
+# scene_transitions.py falls back to OpenCV when this is not installed).
+scenedetect>=0.6,<0.9

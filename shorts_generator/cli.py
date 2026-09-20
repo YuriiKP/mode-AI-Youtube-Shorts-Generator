@@ -27,6 +27,7 @@ _EPILOG = """\
 examples:
   python main.py clip                       # uses INPUT / OUTPUT_DIR from .env
   python main.py clip -i "video/talk.mkv" -n 5
+  python main.py clip --slide --slide-transition-gap 3   # slide crop across cuts
   python main.py transcribe                 # writes <video>.srt next to the video
   python main.py music -m music/            # random track from a folder
   python main.py music -m song.mp3          # one specific track
@@ -122,6 +123,22 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="track faces for the vertical crop (default: on)",
+    )
+    parser.add_argument(
+        "--slide",
+        dest="slide_effect",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="slide the crop window across scene transitions inside each clip "
+        "(default: off)",
+    )
+    parser.add_argument(
+        "--slide-transition-gap",
+        dest="slide_transition_gap",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="group transitions closer than this into one slide (default: 3)",
     )
 
 

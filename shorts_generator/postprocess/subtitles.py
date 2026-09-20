@@ -13,14 +13,15 @@ comma and dot millisecond separators.
 
 from __future__ import annotations
 
+import math
 import os
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
-from moviepy import CompositeVideoClip, ImageClip, TextClip
+from moviepy import CompositeVideoClip, ImageClip, TextClip, VideoClip
 from moviepy.video.fx import CrossFadeIn, Resize
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from ..config import Settings
 from ..cues import split_segments_into_cues
@@ -300,6 +301,100 @@ def _get_visible_center_position(
     return x, y
 
 
+def _blur_shadow_clip(clip: TextClip, radius: float) -> ImageClip:
+    """Return a static copy of ``clip`` with its alpha silhouette blurred.
+
+    The shadow text never changes over the life of a cue, so it is flattened
+    into a single ``ImageClip`` whose mask is the blurred alpha. The Gaussian
+    blur therefore runs once per cue instead of on every rendered frame.
+    """
+    frame = np.asarray(clip.get_frame(0))
+    if frame.dtype != np.uint8:
+        frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb = Image.fromarray(frame[:, :, :3])
+
+    if clip.mask is not None:
+        alpha_frame = np.asarray(clip.mask.get_frame(0), dtype=np.float64)
+        alpha = Image.fromarray(
+            (np.clip(alpha_frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+        )
+    else:
+        alpha = Image.new("L", rgb.size, 255)
+
+    alpha = alpha.filter(ImageFilter.GaussianBlur(float(radius)))
+
+    return ImageClip(np.array(rgb)).with_mask(
+        ImageClip(np.asarray(alpha, dtype="float32") / 255.0, is_mask=True)
+    )
+
+
+def _subtitle_shadow_clip(
+    wrapped_txt: str,
+    settings: Settings,
+    font_path: str,
+    font_size: int,
+    stroke_width: int,
+    interline: int,
+    size,
+    margin,
+) -> Optional[VideoClip]:
+    """Build a solid drop-shadow copy of the subtitle text, or ``None``.
+
+    The shadow is the same text rendered in a single flat colour — both fill and
+    stroke use ``SUBTITLE_SHADOW_COLOR`` so the glyph reads as a solid silhouette
+    — then faded to ``SUBTITLE_SHADOW_OPACITY``. :func:`create_text_clip`
+    composites it behind the real text, shifted by ``SUBTITLE_SHADOW_OFFSET_X``
+    and ``SUBTITLE_SHADOW_OFFSET_Y`` pixels.
+    """
+    if not getattr(settings, "subtitle_shadow", False):
+        return None
+
+    shadow_color = settings.subtitle_shadow_color
+    clip = TextClip(
+        text=wrapped_txt,
+        font=font_path,
+        font_size=font_size,
+        color=shadow_color,
+        bg_color=None,
+        stroke_color=shadow_color,
+        stroke_width=stroke_width,
+        interline=interline,
+        size=size,
+        text_align="center",
+        margin=margin,
+    )
+
+    opacity = float(getattr(settings, "subtitle_shadow_opacity", 1.0) or 0.0)
+    opacity = max(0.0, min(1.0, opacity))
+    if opacity < 1.0:
+        clip = clip.with_opacity(opacity)
+
+    blur = float(getattr(settings, "subtitle_shadow_blur", 0.0) or 0.0)
+    if blur > 0:
+        clip = _blur_shadow_clip(clip, blur)
+    return clip
+
+
+def _stack_subtitle_layers(
+    layers,
+    width: int,
+    height: int,
+    pad: int = 0,
+):
+    """Composite ``(clip, (x, y))`` layers onto a transparent canvas.
+
+    ``pad`` grows the canvas on every side (and shifts each layer by the same
+    amount) so a drop shadow offset outwards is not clipped by the layers below
+    it. With a single layer and no padding it returns that clip directly.
+    """
+    if pad <= 0 and len(layers) == 1:
+        clip, position = layers[0]
+        return clip.with_position(position)
+
+    positioned = [clip.with_position((x + pad, y + pad)) for clip, (x, y) in layers]
+    return CompositeVideoClip(positioned, size=(width + 2 * pad, height + 2 * pad))
+
+
 # ---------------------------------------------------------------------------
 # Text clip construction
 # ---------------------------------------------------------------------------
@@ -429,6 +524,29 @@ def create_text_clip(
             text_w = int(max_width)
     box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
 
+    # Drop-shadow placement. ``shadow_pad`` grows the compositing canvas so an
+    # outward-offset, blurred shadow is not clipped by the tight background box.
+    shadow_dx = int(getattr(settings, "subtitle_shadow_offset_x", 0) or 0)
+    shadow_dy = int(getattr(settings, "subtitle_shadow_offset_y", 0) or 0)
+    shadow_blur = max(0.0, float(getattr(settings, "subtitle_shadow_blur", 0.0) or 0.0))
+    shadow_pad = (
+        max(abs(shadow_dx), abs(shadow_dy)) + int(math.ceil(shadow_blur * 3))
+        if getattr(settings, "subtitle_shadow", False)
+        else 0
+    )
+
+    def _shadow_for(size, margin):
+        return _subtitle_shadow_clip(
+            wrapped_txt,
+            settings,
+            font_path,
+            font_size,
+            stroke_width,
+            interline,
+            size,
+            margin,
+        )
+
     if rounded_bg_enabled:
         radius = max(8, int(font_size * 0.4))
         text_clip = TextClip(
@@ -453,10 +571,17 @@ def create_text_clip(
             radius=radius,
         )
         text_position = _get_visible_center_position(text_clip, box_w, clip_h)
-        clip = CompositeVideoClip(
-            [bg_clip, text_clip.with_position(text_position)],
-            size=(box_w, clip_h),
-        )
+        layers: List[Tuple[VideoClip, Tuple[int, int]]] = [
+            (bg_clip, (0, 0)),
+            (text_clip, text_position),
+        ]
+        shadow = _shadow_for((box_w, None), (0, text_clip_margin_y))
+        if shadow is not None:
+            layers.insert(
+                1,
+                (shadow, (text_position[0] + shadow_dx, text_position[1] + shadow_dy)),
+            )
+        clip = _stack_subtitle_layers(layers, box_w, clip_h, shadow_pad)
     elif bg_color:
         text_clip = TextClip(
             text=wrapped_txt,
@@ -480,12 +605,19 @@ def create_text_clip(
             radius=0,
         )
         text_position = _get_visible_center_position(text_clip, size[0], size[1])
-        clip = CompositeVideoClip(
-            [bg_clip, text_clip.with_position(text_position)],
-            size=size,
-        )
+        layers: List[Tuple[VideoClip, Tuple[int, int]]] = [
+            (bg_clip, (0, 0)),
+            (text_clip, text_position),
+        ]
+        shadow = _shadow_for((box_w, None), (0, text_clip_margin_y))
+        if shadow is not None:
+            layers.insert(
+                1,
+                (shadow, (text_position[0] + shadow_dx, text_position[1] + shadow_dy)),
+            )
+        clip = _stack_subtitle_layers(layers, size[0], size[1], shadow_pad)
     else:
-        clip = TextClip(
+        text_clip = TextClip(
             text=wrapped_txt,
             font=font_path,
             font_size=font_size,
@@ -497,6 +629,18 @@ def create_text_clip(
             size=(int(max_width), clip_h),
             text_align="center",
         )
+        shadow = _shadow_for((int(max_width), clip_h), (None, None))
+        if shadow is None:
+            clip = text_clip
+        else:
+            # No background: recompose the text over its shadow on a transparent
+            # canvas of the same footprint as before.
+            clip = _stack_subtitle_layers(
+                [(text_clip, (0, 0)), (shadow, (shadow_dx, shadow_dy))],
+                int(max_width),
+                clip_h,
+                shadow_pad,
+            )
 
     start, end = subtitle_item[0]
     clip = clip.with_start(start)
