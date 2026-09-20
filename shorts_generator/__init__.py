@@ -7,6 +7,7 @@ wrapper around the functions below.
 
 from .config import ConfigError, Settings, load_settings
 from .pipeline import generate_shorts, generate_subtitles, resolve_input_videos
+from .preview import render_preview_frames
 
 __all__ = [
     "Settings",
@@ -15,4 +16,5 @@ __all__ = [
     "generate_shorts",
     "generate_subtitles",
     "resolve_input_videos",
+    "render_preview_frames",
 ]

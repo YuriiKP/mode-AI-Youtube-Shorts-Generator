@@ -45,6 +45,7 @@ python main.py clip         # нарезать исходник в ранжир�
 python main.py transcribe   # Whisper -> <видео>.srt (файл или папка)
 python main.py music        # добавить музыку (MUSIC: файл или папка)
 python main.py subtitles    # вшить субтитры (из .srt или через Whisper)
+python main.py preview      # один случайный кадр — быстро увидеть итог настроек картинки
 python main.py all          # нарезка + музыка + субтитры одной командой
 ```
 
@@ -71,6 +72,8 @@ python main.py subtitles --banner assets/logo.png --banner-position top  # ба�
 python main.py all --banner "@mychannel" --banner-position bottom   # весь пайплайн + баннер
 python main.py all                             # весь пайплайн из .env
 python main.py clip --slide                     # нарезка со скольжением по кадру
+python main.py preview                          # тестовый кадр для подбора картинки
+python main.py preview --saturation 1.2 --background-blur 40   # тест эффектов без рендера
 ```
 
 - **clip**: `-n/--num-clips`, `-a/--aspect-ratio`, `--format`, `-l/--language`,
@@ -84,6 +87,9 @@ python main.py clip --slide                     # нарезка со сколь
 - **вертикальный кадр и баннер** (`subtitles`, `music`, `all`):
   `--[no-]fit-vertical`, `--fit-aspect-ratio W:H`, `--background-blur N`,
   `--banner TEXT|PATH`, `--banner-position {top,bottom,center}`.
+- **preview**: `--[no-]subtitles-enabled`, `--count N`, `--time SECONDS` плюс все
+  флаги картинки из «вертикальный кадр и баннер». Рендерит один случайный кадр и
+  сохраняет его в `OUTPUT_DIR/preview_frame.png`.
 
 ## Субтитры
 
@@ -182,6 +188,53 @@ python main.py subtitles -i clip.mp4 --no-fit-vertical
 # цветокоррекция: насыщенность, резкость и лёгкая хроматическая аберрация
 python main.py subtitles -i clip.mp4 --saturation 1.2 --sharpness 1.0 --chromatic-aberration 3
 ```
+
+## Тестовый кадр (команда preview)
+
+Настройку картинки удобно подбирать на **одном кадре**, а не на целом рендере.
+Команда `preview` берёт **один случайный кадр** из исходного видео и прогоняет
+его через те же этапы, что и настоящий рендер, после чего сохраняет результат
+картинкой:
+
+1. случайный кадр из случайного входного видео;
+2. цветокоррекция и эффекты (тот же FFmpeg-фильтр, что и при рендере);
+3. доводка до вертикального кадра 9:16 с размытым фоном (`FIT_*`,
+   `BACKGROUND_*`);
+4. субтитры и баннер.
+
+Распознавание речи **не запускается**: если субтитры включены, вместо текста
+рисуется заглушка `тестовый кадр` (тем же рендерером, что и настоящие реплики),
+поэтому разные настройки субтитров и баннера проверяются за секунды — без ожидания
+Whisper. Результат пишется в `OUTPUT_DIR/preview_frame.png`.
+
+```bash
+# один случайный кадр с текущими настройками из .env
+python main.py preview
+
+# сравнить настройки на одном и том же кадре (фиксированное время — 5 секунд)
+python main.py preview --time 5
+
+# быстрый тест эффектов и размытия фона без полного рендера
+python main.py preview --saturation 1.2 --sharpness 1.0 --background-blur 40
+
+# сразу несколько случайных кадров (в т.ч. из разных видео в папке)
+python main.py preview -i video --count 4
+
+# только картинка, без субтитров
+python main.py preview --no-subtitles-enabled
+
+# баннер в тестовом кадре
+python main.py preview --banner "@mychannel" --banner-position bottom
+```
+
+- `--count N` — сколько случайных кадров отрисовать (по умолчанию 1). При
+  нескольких файлах именуются `preview_frame_1.png`, `preview_frame_2.png`, ...;
+- `--time SECONDS` — взять этот момент вместо случайного (удобно сравнивать
+  настройки на неизменном кадре);
+- `--[no-]subtitles-enabled` — рисовать ли пробную реплику субтитров;
+- все флаги картинки (`--[no-]fit-vertical`, `--fit-aspect-ratio`,
+  `--background-blur`, `--banner`, `--banner-position`, `--saturation`,
+  `--sharpness`, `--chromatic-aberration`) перекрывают `.env` на один запуск.
 
 ## Скольжение по кадру (SLIDE_EFFECT)
 
@@ -304,6 +357,7 @@ shorts_generator/
 ├── subtitles.py            Whisper -> .srt
 ├── cues.py                 нарезка транскрипта на короткие реплики-субтитры
 ├── enhance.py              музыка + субтитры на каждый клип (команда all)
+├── preview.py              тестовый кадр для подбора картинки (команда preview)
 ├── timing.py                замер времени по этапам (download/transcribe/...)
 └── postprocess/            движок вшивания (субтитры + музыка + баннер + вертикальный кадр + эффекты)
 ```

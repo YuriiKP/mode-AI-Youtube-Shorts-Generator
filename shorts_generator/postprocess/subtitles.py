@@ -633,10 +633,12 @@ def create_text_clip(
         if shadow is None:
             clip = text_clip
         else:
-            # No background: recompose the text over its shadow on a transparent
-            # canvas of the same footprint as before.
+            # No background: draw the shadow first (bottom layer) and the real
+            # text last (top layer) so the offset silhouette peeks out around
+            # the letters as an outer drop shadow instead of being painted over
+            # them, which would read as an inner shadow.
             clip = _stack_subtitle_layers(
-                [(text_clip, (0, 0)), (shadow, (shadow_dx, shadow_dy))],
+                [(shadow, (shadow_dx, shadow_dy)), (text_clip, (0, 0))],
                 int(max_width),
                 clip_h,
                 shadow_pad,

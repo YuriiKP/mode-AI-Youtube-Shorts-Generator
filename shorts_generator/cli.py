@@ -33,6 +33,7 @@ examples:
   python main.py music -m song.mp3          # one specific track
   python main.py subtitles                  # same-named .srt, else Whisper
   python main.py all                        # everything, reading settings from .env
+  python main.py preview                    # one random frame with the picture look
 
 Configuration: copy .env.example to .env and edit it. Values there are the
 defaults for every command; flags override them for a single run.
@@ -372,6 +373,46 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(allp)
     _add_common(allp)
 
+    # preview ---------------------------------------------------------------
+    preview = sub.add_parser(
+        "preview",
+        help="render one random frame with the current picture settings",
+        description=(
+            "Render a single random frame through the same picture stages as a "
+            "real short (vertical frame + blurred background, colour/lens "
+            "effects, banner and the subtitle look) and save it as a PNG. No "
+            "transcription happens: when subtitles are on the placeholder text "
+            '"тестовый кадр" is drawn, so the look can be tuned in seconds.'
+        ),
+    )
+    _add_io(preview)
+    _add_render_options(preview)
+    preview.add_argument(
+        "--subtitles-enabled",
+        dest="add_subtitles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="draw a sample subtitle cue in the test frame (default: on)",
+    )
+    preview.add_argument(
+        "--count",
+        dest="preview_count",
+        type=int,
+        default=1,
+        metavar="N",
+        help="how many random frames to render (default: 1)",
+    )
+    preview.add_argument(
+        "--time",
+        dest="preview_time",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="sample this second instead of a random one (handy to compare "
+        "settings on the very same frame)",
+    )
+    _add_common(preview)
+
     return parser
 
 
@@ -615,12 +656,31 @@ def cmd_all(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preview(settings: Settings, args: argparse.Namespace) -> int:
+    from .preview import render_preview_frames
+
+    paths = render_preview_frames(
+        settings,
+        count=int(getattr(args, "preview_count", 1) or 1),
+        subtitles=bool(getattr(args, "add_subtitles", True)),
+        timestamp=getattr(args, "preview_time", None),
+    )
+
+    print("\n" + "=" * 72)
+    print(f"preview frame(s) written: {len(paths)}")
+    for path in paths:
+        print(f"  - {path}")
+    print("=" * 72)
+    return 0
+
+
 _COMMANDS = {
     "clip": cmd_clip,
     "transcribe": cmd_transcribe,
     "music": cmd_music,
     "subtitles": cmd_subtitles,
     "all": cmd_all,
+    "preview": cmd_preview,
 }
 
 

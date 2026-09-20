@@ -7,6 +7,7 @@ project can be run the familiar way:
     python main.py transcribe
     python main.py music
     python main.py subtitles
+    python main.py preview
     python main.py all
 """
 
