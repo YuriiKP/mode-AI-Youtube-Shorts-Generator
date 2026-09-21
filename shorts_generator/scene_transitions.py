@@ -84,6 +84,14 @@ def _group_boundaries(
 
     Returns the segment boundaries as ``[0.0, ...cuts..., duration]``; clustered
     transitions contribute a single boundary so the slide spans the whole group.
+
+    Every neighbouring pair of boundaries is kept at least ``gap`` seconds apart
+    — including the distance to ``0.0`` and to ``duration`` — so each slide
+    segment lasts at least ``gap`` seconds and the pan never whips across the
+    frame in a fraction of a second. Transitions closer than ``gap`` to the start
+    or to the end are dropped, so the slide simply continues straight through
+    them. The only case a segment can be shorter than ``gap`` is a clip that is
+    itself shorter than ``gap``, where a full-length slide simply does not fit.
     """
     boundaries: List[float] = [0.0]
     for time in sorted(transitions):
@@ -91,6 +99,8 @@ def _group_boundaries(
             continue
         if time - boundaries[-1] < gap:
             continue  # too close to the previous boundary -> same group
+        if duration - time < gap:
+            continue  # too close to the end to fit a full-length slide
         boundaries.append(time)
     boundaries.append(duration)
     return boundaries

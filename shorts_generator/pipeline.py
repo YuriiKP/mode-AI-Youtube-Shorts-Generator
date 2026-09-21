@@ -80,6 +80,7 @@ def _process_one(
             face_tracking=settings.face_tracking,
             slide_effect=settings.slide_effect,
             slide_gap=settings.slide_transition_gap,
+            slide_range=settings.slide_range,
         )
 
     if enhance:

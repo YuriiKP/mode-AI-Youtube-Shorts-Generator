@@ -268,6 +268,12 @@ class Settings:
     # Переходы, отстоящие друг от друга ближе, чем это значение (в секундах),
     # объединяются в одну группу: скольжение идёт сразу через всю группу.
     slide_transition_gap: float = 3.0
+    # Доля полного горизонтального хода окна кропа, которую использует
+    # скольжение (0..1). 1.0 — окно проезжает от самого края широкого кадра до
+    # противоположного (весь доступный ход); 0 — движения нет, окно стоит по
+    # центру; промежуточные значения оставляют одинаковый отступ от обоих краёв,
+    # до которых может уезжать кадр.
+    slide_range: float = 1.0
 
     # LLM (highlight ranking) ---------------------------------------------
     llm_provider: str = "openai"  # openai | deepseek | gemini
@@ -472,6 +478,7 @@ _FLOAT_FIELDS = {
     "sharpness",
     "chromatic_aberration",
     "slide_transition_gap",
+    "slide_range",
 }
 
 
@@ -590,6 +597,8 @@ def _validate(settings: Settings) -> None:
         )
     if settings.slide_transition_gap < 0:
         raise ConfigError("SLIDE_TRANSITION_GAP must be zero or greater")
+    if not 0.0 <= settings.slide_range <= 1.0:
+        raise ConfigError("SLIDE_RANGE must be between 0 and 1")
     if settings.font_size <= 0:
         raise ConfigError("FONT_SIZE must be a positive integer")
     if settings.threads < 0:

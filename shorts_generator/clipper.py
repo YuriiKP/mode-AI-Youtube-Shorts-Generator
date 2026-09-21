@@ -80,6 +80,7 @@ def _reframe_vertical(
     face_tracking: bool = True,
     slide_effect: bool = False,
     slide_gap: float = 3.0,
+    slide_range: float = 1.0,
 ) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -142,8 +143,14 @@ def _reframe_vertical(
     # crop window from one side of the wide frame to the other, alternating the
     # direction at every (grouped) transition.
     max_x0 = max(0, src_w - crop_w)
+    # ``slide_range`` (0..1) scales the full left/right travel. The reduced
+    # range is centred, so ``1.0`` pans the window edge-to-edge and ``0.0``
+    # freezes it in the middle, leaving an equal inset from both edges.
+    range_fraction = min(1.0, max(0.0, slide_range))
+    travel = int(round(max_x0 * range_fraction))
+    slide_base = (max_x0 - travel) // 2
     slide_segments = []
-    if slide_effect and max_x0 > 0:
+    if slide_effect and max_x0 > 0 and travel > 0:
         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
         duration = (frame_count / fps) if fps else 0.0
         try:
@@ -190,9 +197,9 @@ def _reframe_vertical(
         cx, cy = last_center
         y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
 
-        if slide_segments:
+        if slide_effect and max_x0 > 0:
             progress = slide_progress(frame_index / fps if fps else 0.0, slide_segments)
-            x0 = int(round(progress * max_x0))
+            x0 = slide_base + int(round(progress * travel))
             x0 = max(0, min(max_x0, x0))
         else:
             x0 = max(0, min(max_x0, cx - crop_w // 2))
@@ -245,6 +252,7 @@ def crop_clip(
     face_tracking: bool = True,
     slide_effect: bool = False,
     slide_gap: float = 3.0,
+    slide_range: float = 1.0,
 ) -> str:
     """Cut + reframe one highlight, returning the mp4 path."""
     cut_path = out_path + ".cut.mp4"
@@ -257,6 +265,7 @@ def crop_clip(
             face_tracking=face_tracking,
             slide_effect=slide_effect,
             slide_gap=slide_gap,
+            slide_range=slide_range,
         )
     finally:
         if os.path.exists(cut_path):
@@ -272,6 +281,7 @@ def crop_highlights(
     face_tracking: bool = True,
     slide_effect: bool = False,
     slide_gap: float = 3.0,
+    slide_range: float = 1.0,
 ) -> List[Dict]:
     out_dir = out_dir or DEFAULT_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -295,6 +305,7 @@ def crop_highlights(
                 face_tracking=face_tracking,
                 slide_effect=slide_effect,
                 slide_gap=slide_gap,
+                slide_range=slide_range,
             )
             results.append({**h, "clip_url": out_path})
         except Exception as e:

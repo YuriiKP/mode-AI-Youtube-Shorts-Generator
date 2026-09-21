@@ -141,6 +141,15 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         metavar="SECONDS",
         help="group transitions closer than this into one slide (default: 3)",
     )
+    parser.add_argument(
+        "--slide-range",
+        dest="slide_range",
+        type=float,
+        default=None,
+        metavar="0..1",
+        help="fraction of the full crop travel used by the slide: 1 = edge to "
+        "edge, 0 = no movement (default: 1)",
+    )
 
 
 def _add_music_options(parser: argparse.ArgumentParser) -> None:
