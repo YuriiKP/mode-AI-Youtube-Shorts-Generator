@@ -282,15 +282,19 @@ def crop_highlights(
     slide_effect: bool = False,
     slide_gap: float = 3.0,
     slide_range: float = 1.0,
+    start_index: int = 0,
 ) -> List[Dict]:
     out_dir = out_dir or DEFAULT_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
     # Include the source file name in every clip so that processing several
     # videos into the same folder does not overwrite clips from earlier ones.
+    # ``start_index`` keeps the clip number a single running order across all
+    # source videos (first short ever = 1, regardless of which input it is).
     source_stem = os.path.splitext(os.path.basename(source_path))[0]
     results: List[Dict] = []
     for i, h in enumerate(highlights, 1):
-        out_path = os.path.join(out_dir, f"short_{i:02d}_{source_stem}.mp4")
+        number = start_index + i
+        out_path = os.path.join(out_dir, f"short_{number:02d}_{source_stem}.mp4")
         print(
             f"[clip] {i}/{len(highlights)}: {h.get('title', '(untitled)')}",
             flush=True,

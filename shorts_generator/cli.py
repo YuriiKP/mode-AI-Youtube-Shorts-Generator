@@ -482,11 +482,12 @@ def _write_shorts_info(result: Dict, output_dir: str) -> Optional[str]:
             continue
         source = video.get("source_video_url") or result.get("source_video_url")
         lines = [f"Источник: {os.path.basename(str(source))}", ""]
-        index = 0
+        # ``total`` is never reset between videos: the #N numbering is a single
+        # running order across every input, matching the numbers in the clip
+        # file names (short_01_..., short_02_...).
         for short in shorts:
-            index += 1
             total += 1
-            lines.append(f"#{index}")
+            lines.append(f"#{total}")
             lines.append(f"Название:    {short.get('title') or '(без названия)'}")
             lines.append(f"Описание:    {short.get('description') or '(без описания)'}")
             clip = short.get("clip_url")

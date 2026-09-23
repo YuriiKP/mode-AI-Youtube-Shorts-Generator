@@ -33,8 +33,14 @@ def _process_one(
     enhance: bool,
     add_music: bool,
     burn_subtitles: bool,
+    start_index: int = 0,
 ) -> Dict:
-    """Run transcribe -> highlights -> crop (-> enhance) for one local video."""
+    """Run transcribe -> highlights -> crop (-> enhance) for one local video.
+
+    ``start_index`` is the number of shorts already rendered by earlier source
+    videos; clip numbering continues from there so the number in each file name
+    is a single running order across all inputs.
+    """
     with timer.stage("transcribe"):
         transcript = transcribe(source_path, settings)
     if not transcript["segments"]:
@@ -81,6 +87,7 @@ def _process_one(
             slide_effect=settings.slide_effect,
             slide_gap=settings.slide_transition_gap,
             slide_range=settings.slide_range,
+            start_index=start_index,
         )
 
     if enhance:
@@ -119,19 +126,21 @@ def _run(
         source_paths = resolve_input_videos(settings)
 
     videos: List[Dict] = []
+    rendered = 0  # running total of shorts produced so far (all videos)
     for source_path in source_paths:
         if len(source_paths) > 1:
             print(f"[pipeline] video: {os.path.basename(source_path)}", flush=True)
-        videos.append(
-            _process_one(
-                source_path,
-                settings,
-                timer,
-                enhance=enhance,
-                add_music=add_music,
-                burn_subtitles=burn_subtitles,
-            )
+        video = _process_one(
+            source_path,
+            settings,
+            timer,
+            enhance=enhance,
+            add_music=add_music,
+            burn_subtitles=burn_subtitles,
+            start_index=rendered,
         )
+        rendered += len(video.get("shorts") or [])
+        videos.append(video)
 
     single = len(videos) == 1
     return {
