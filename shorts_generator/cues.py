@@ -18,7 +18,7 @@ split transcript yields the very same cues.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 # Punctuation that closes a sentence; a new cue starts right after it.
 _SENTENCE_END = frozenset(".!?…")
@@ -279,3 +279,55 @@ def split_segments_into_cues(
         cues.extend(segment_cues)
 
     return cues
+
+
+def phrase_boundaries(
+    segments: Iterable[Dict],
+    *,
+    pause_threshold: float = 0.6,
+) -> List[Tuple[float, bool]]:
+    """Times at which a spoken phrase (a whole thought) ends.
+
+    ``segments`` are the short cues produced by :func:`split_segments_into_cues`.
+    A cue break only marks a phrase break when it falls on real punctuation
+    (``.!?…``) or on a pause in speech. A cue that was cut short purely by the
+    length caps contributes no boundary — its phrase is considered to run on
+    until the next sentence end or silence, so a caller can trim or extend a
+    clip without ever leaving it hanging on half a sentence.
+
+    Args:
+        segments: transcript segments (``{"start", "end", "text"}``).
+        pause_threshold: silence (in seconds) after a segment that also closes
+            the phrase.
+
+    Returns:
+        Sorted ``(time, closes_sentence)`` pairs, i.e. only the points where a
+        phrase really ends. ``closes_sentence`` is ``True`` for a boundary backed
+        by punctuation (``.!?…``) and ``False`` for one backed only by a pause —
+        a pause can fall in the middle of a thought, so callers may prefer the
+        firmer boundary. The list is empty when the transcript has neither
+        punctuation nor pauses.
+    """
+    spans: List[Tuple[float, float, str]] = []
+    for segment in segments or []:
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        spans.append((start, end, _normalize(segment.get("text", ""))))
+    spans.sort()
+
+    boundaries: List[Tuple[float, bool]] = []
+    for index, (_, end, text) in enumerate(spans):
+        # A cue break is a phrase break only when the speech really stops
+        # there: the text closes a sentence, or a real pause follows. A cue cut
+        # short by the length caps — and a transcript that simply ends
+        # mid-sentence — leaves its phrase running on, so it is not reported.
+        closes_sentence = _ends_sentence(text)
+        paused = index + 1 < len(spans) and spans[index + 1][0] - end >= pause_threshold
+        if closes_sentence or paused:
+            boundaries.append((end, closes_sentence))
+    return boundaries

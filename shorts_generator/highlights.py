@@ -16,6 +16,7 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
+from .cues import phrase_boundaries
 from .llm import call_llm
 
 LLMFn = Callable[[str], str]
@@ -109,6 +110,20 @@ CHUNK_SIZE_SECONDS = 1200  # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800  # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 MAX_HIGHLIGHT_API_ATTEMPTS = 3
+
+# Насколько далеко край клипа может уехать (в секундах) от границы реплики,
+# выбранной LLM, чтобы попасть на настоящую границу фразы — конец предложения
+# или паузу. Ограничение не даёт транскрипту без пунктуации и пауз растянуть
+# или обрезать клип далеко от задуманного окна.
+_MAX_PHRASE_SHIFT = 5.0
+
+# Насколько «ближе» считается граница, закрывающая предложение (с точкой,
+# вопросом или восклицанием), по сравнению с границей, за которой лишь пауза.
+# Пауза вполне может стоять посреди мысли («… Всё-таки <пауза> она…»), и тогда
+# короткий обрубок в концовке тоже заканчивается паузой. Небольшая фора
+# заставляет предпочесть стоящий рядом настоящий конец предложения, но при
+# этом длинный обрубок, до конца которого LLM явно дотянулось, остаётся.
+_SENTENCE_BONUS = 1.5
 
 
 def _parse_json_loose(raw: str) -> Dict:
@@ -328,22 +343,76 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
+def _nearest_boundary(
+    boundaries: List[Tuple[float, bool]],
+    target: float,
+    *,
+    limit: float,
+    prefer_later: bool,
+) -> Optional[float]:
+    """Return the phrase boundary closest to ``target`` (within ``limit``).
+
+    ``boundaries`` are the ``(time, closes_sentence)`` pairs from
+    :func:`cues.phrase_boundaries`. A boundary that really closes a sentence is
+    ranked ``_SENTENCE_BONUS`` seconds nearer than it is, so that a firm
+    sentence end wins over a mid-thought pause that merely happens to sit right
+    at the clip's edge (which is exactly how the dangling «…Вот и» / «…Всё-таки»
+    tails appear). The ``limit`` still applies to the true distance.
+
+    An exact tie is broken towards the outside of the clip: the later boundary
+    for a clip's end (extend the phrase rather than trim it) and the earlier one
+    for its start (keep the chosen hook). ``None`` means no boundary is close
+    enough, so the caller keeps the plain cue edge.
+    """
+    best: Optional[float] = None
+    best_key: Optional[Tuple[float, float]] = None
+    for boundary, closes_sentence in boundaries:
+        distance = abs(boundary - target)
+        if distance > limit:
+            continue
+        score = distance - (_SENTENCE_BONUS if closes_sentence else 0.0)
+        key = (score, -boundary if prefer_later else boundary)
+        if best_key is None or key < best_key:
+            best, best_key = boundary, key
+    return best
+
+
 def snap_highlights_to_transcript(
     highlights: List[Dict],
     transcript: Dict,
     *,
     start_padding: float = 0.0,
     end_padding: float = 0.0,
+    pause_threshold: float = 0.6,
     max_end: Optional[float] = None,
 ) -> List[Dict]:
-    """Расширить границы хайлайтов до целых фраз транскрипта.
+    """Привязать границы хайлайтов к целым фразам транскрипта.
 
-    LLM выбирает ``start_time``/``end_time`` по тексту, поэтому граница часто
-    попадает в середину фразы — крайние слова обрезаются. Здесь окно каждого
-    хайлайта расширяется (но никогда не сужается) до границ перекрывающихся
-    кью: начало — до начала первого, конец — до конца последнего. Затем
-    добавляется запас ``start_padding``/``end_padding``; заход в соседнюю фразу
-    ограничивается, чтобы не подрезать следующую.
+    LLM выбирает ``start_time``/``end_time`` по тексту транскрипта, где видны
+    только начала реплик, но не их концы, поэтому граница почти всегда падает
+    внутрь фразы. Попавший в окно обрубок следующей реплики («…Вот и»,
+    «…Всё-таки») — это и есть та «лишняя» концовка, из-за которой клип
+    обрывается на полуфразе.
+
+    Работает в два шага. Сначала окно расширяется до границ перекрывающихся
+    кью (как и раньше): начало — до начала первого, конец — до конца последнего.
+    Затем обе границы сдвигаются к ближайшей *настоящей* границе фразы — концу
+    предложения или паузе в речи; границы, возникшие лишь из-за ограничений
+    длины реплики, фразой не считаются (см. ``cues.phrase_boundaries``). Обрубок
+    в концовке при этом либо отбрасывается, если он ближе, либо достраивается до
+    целой фразы. Начало клипа двигается только назад, к началу фразы, чтобы
+    никогда не срезать выбранный хук.
+
+    Конец предложения (знак ``.!?…``) считается надёжной границей, а пауза —
+    нет: пауза легко встаёт посреди мысли («… Всё-таки <пауза> она…»), и именно
+    так появляется короткий обрубок в концовке. Поэтому граница с точкой
+    получает фору ``_SENTENCE_BONUS`` и выигрывает у стоящей рядом паузы, но
+    длинный обрубок, до конца которого LLM явно дотянулось, сохраняется.
+
+    Сдвиг ограничен ``_MAX_PHRASE_SHIFT`` секундами: если рядом нет настоящей
+    границы фразы (транскрипт без пунктуации и пауз), край остаётся на границе
+    реплики — как и раньше. В самом конце добавляется запас
+    ``start_padding``/``end_padding``, не заходя при этом в соседнюю реплику.
 
     Изменённые границы пишутся прямо в словари ``highlights``, поэтому нарезка
     и периклиповые субтитры используют их согласованно.
@@ -359,6 +428,13 @@ def snap_highlights_to_transcript(
             cues.append((cue_start, cue_end))
     cues.sort()
 
+    # Настоящие границы фраз: концы предложений и паузы в речи. Начало (0 с)
+    # и конец видео сюда не входят — иначе клип без пунктуации и пауз рядом с
+    # ними растянуло бы до самого края дорожки.
+    boundaries = phrase_boundaries(
+        transcript.get("segments", []), pause_threshold=pause_threshold
+    )
+
     for highlight in highlights:
         try:
             start = float(highlight["start_time"])
@@ -372,18 +448,40 @@ def snap_highlights_to_transcript(
         covered_start = min(c[0] for c in overlapping)
         covered_end = max(c[1] for c in overlapping)
 
-        prev_end = next((c[1] for c in reversed(cues) if c[1] <= covered_start), None)
-        next_start = next((c[0] for c in cues if c[0] >= covered_end), None)
+        # Начало — ближайшая граница фразы не позже текущего края окна: двигаем
+        # только назад, чтобы не обрезать хук.
+        phrase_start = _nearest_boundary(
+            [b for b in boundaries if b[0] <= covered_start],
+            start,
+            limit=_MAX_PHRASE_SHIFT,
+            prefer_later=False,
+        )
+        if phrase_start is None:
+            phrase_start = covered_start
 
-        new_start = covered_start - start_padding
+        # Конец — ближайшая граница фразы: если ближе обрубок в концовке, он
+        # отбрасывается; если ближе конец начатой фразы — клип достраивается.
+        phrase_end = _nearest_boundary(
+            [b for b in boundaries if b[0] > phrase_start],
+            end,
+            limit=_MAX_PHRASE_SHIFT,
+            prefer_later=True,
+        )
+        if phrase_end is None or phrase_end <= covered_start:
+            phrase_end = covered_end
+
+        prev_end = next((c[1] for c in reversed(cues) if c[1] <= phrase_start), None)
+        next_start = next((c[0] for c in cues if c[0] >= phrase_end), None)
+
+        new_start = phrase_start - start_padding
         if prev_end is not None:
             new_start = max(new_start, prev_end + 0.02)
-        new_start = max(0.0, min(new_start, covered_start))
+        new_start = max(0.0, min(new_start, phrase_start))
 
-        new_end = covered_end + end_padding
+        new_end = phrase_end + end_padding
         if next_start is not None:
             new_end = min(new_end, next_start - 0.02)
-        new_end = max(new_end, covered_end)
+        new_end = max(new_end, phrase_end)
         if max_end is not None:
             new_end = min(new_end, max_end)
 

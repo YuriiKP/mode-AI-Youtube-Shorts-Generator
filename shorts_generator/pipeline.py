@@ -128,6 +128,9 @@ def _process_one(
             transcript,
             start_padding=settings.clip_start_padding,
             end_padding=settings.clip_end_padding,
+            # Тот же порог паузы, что и у субтитров: границы клипов привязываются
+            # к тем же настоящим паузам в речи, на которых рвутся реплики.
+            pause_threshold=settings.subtitle_pause_threshold,
             max_end=float(transcript.get("duration", 0.0)) or None,
         )
 
