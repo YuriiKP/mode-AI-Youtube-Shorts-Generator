@@ -3,8 +3,9 @@
 This is the glue used by the ``all`` command. It reuses the transcript the
 pipeline already computed for highlight ranking, so no extra Whisper pass is
 needed: for each short the overlapping segments are clipped to the clip's time
-range and re-timed to start at zero, written as a per-clip ``.srt`` and burned
-in by the built-in post-processing engine. In the same pass the clip is
+range and re-timed to start at zero, kept in memory and burned in by the
+built-in post-processing engine (no per-clip ``.srt`` file is written to disk).
+In the same pass the clip is
 re-framed to the vertical ``FIT_ASPECT_RATIO`` (empty space filled with a
 blurred copy of the video) and the configured ``BANNER_*`` overlay is drawn, so
 every rendered short comes out as a clean 9:16 video. Background music is mixed
@@ -18,33 +19,23 @@ short dict (``enhance_error``) and do not abort the remaining clips.
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .config import Settings
 
 
-def _format_timestamp(seconds: float) -> str:
-    """Format seconds as an SRT timestamp ``HH:MM:SS,mmm``."""
-    total_ms = max(0, int(round(seconds * 1000)))
-    ms = total_ms % 1000
-    total_s = total_ms // 1000
-    s = total_s % 60
-    total_m = total_s // 60
-    m = total_m % 60
-    h = total_m // 60
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def build_clip_srt(transcript: Dict, start: float, end: float, out_path: str) -> str:
-    """Write a per-clip ``.srt`` derived from the source transcript.
+def build_clip_items(
+    transcript: Dict, start: float, end: float
+) -> List[Tuple[Tuple[float, float], str]]:
+    """Return in-memory subtitle entries for one clip.
 
     Segments overlapping ``[start, end]`` are clipped to that range and shifted
-    so the clip starts at 0. Returns ``out_path`` on success, or ``""`` when the
-    clip contains no speech (in which case no file is written).
+    so the clip starts at 0. Nothing is written to disk — the entries are handed
+    straight to the post-processing engine and burned from memory. Returns an
+    empty list when the clip contains no speech.
     """
     segments = transcript.get("segments", []) or []
-    lines: List[str] = []
-    index = 0
+    items: List[Tuple[Tuple[float, float], str]] = []
 
     for segment in segments:
         try:
@@ -66,20 +57,9 @@ def build_clip_srt(transcript: Dict, start: float, end: float, out_path: str) ->
         if not text:
             continue
 
-        index += 1
-        lines.append(str(index))
-        lines.append(
-            f"{_format_timestamp(clipped_start)} --> {_format_timestamp(clipped_end)}"
-        )
-        lines.append(text)
-        lines.append("")
+        items.append(((clipped_start, clipped_end), text))
 
-    if not lines:
-        return ""
-
-    with open(out_path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-    return out_path
+    return items
 
 
 def enhance_shorts(
@@ -96,7 +76,7 @@ def enhance_shorts(
         transcript: the source transcript (``{"duration", "segments"}``) used to
             derive per-clip subtitles.
         shorts: the short dicts produced by the crop stage; modified in place
-            with ``enhanced`` / ``subtitle_path`` / ``enhance_error``.
+            with ``enhanced`` / ``enhance_error``.
         settings: resolved configuration (music source/volume, subtitle look,
             encoding). Subtitles are always taken from ``transcript`` here.
         add_music: whether to mix in background music.
@@ -117,16 +97,16 @@ def enhance_shorts(
         print(f"[enhance] {i}/{total}: {os.path.basename(clip_path)}", flush=True)
 
         # --- per-clip subtitles, reused from the highlight transcript ------
-        srt_path = ""
+        # Built in memory and handed straight to the engine, so no per-clip
+        # ``.srt`` file is written to disk.
+        subtitle_items: List[Tuple[Tuple[float, float], str]] = []
         if burn_subtitles:
-            candidate = os.path.splitext(clip_path)[0] + ".srt"
-            srt_path = build_clip_srt(
+            subtitle_items = build_clip_items(
                 transcript,
                 float(short.get("start_time", 0.0)),
                 float(short.get("end_time", 0.0)),
-                candidate,
             )
-            if not srt_path:
+            if not subtitle_items:
                 print(
                     "[enhance]   no speech in this clip; skipping subtitles", flush=True
                 )
@@ -139,14 +119,13 @@ def enhance_shorts(
                 clip_path,
                 temp_out,
                 settings,
-                burn_subtitles=bool(srt_path),
+                burn_subtitles=bool(subtitle_items),
                 add_music=add_music,
-                subtitle_file=srt_path or None,
+                subtitle_items=subtitle_items,
             )
             os.replace(temp_out, clip_path)
             short["enhanced"] = True
-            if srt_path:
-                short["subtitle_path"] = srt_path
+
             print("[enhance]   done", flush=True)
         except Exception as exc:  # noqa: BLE001 - report and keep going
             print(f"[enhance]   failed: {exc}", flush=True)

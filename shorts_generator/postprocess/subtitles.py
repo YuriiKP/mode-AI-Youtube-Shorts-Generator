@@ -678,12 +678,27 @@ def build_subtitle_clips(
 ):
     """Parse ``subtitle_path`` and return a list of positioned text clips.
 
-    Each subtitle entry is passed through the cue splitter first, so an ``.srt``
-    that still holds whole sentences (an old cache or a hand-made file) is broken
-    into short on-screen phrases instead of one long block. Entries that are
-    already short cues pass through unchanged.
+    Thin wrapper over :func:`build_subtitle_clips_from_items` for the callers
+    that still read a ``.srt`` from disk.
     """
-    items = load_subtitles(subtitle_path)
+    return build_subtitle_clips_from_items(
+        load_subtitles(subtitle_path), settings, video_width, video_height, font_path
+    )
+
+
+def build_subtitle_clips_from_items(
+    items: List[SubtitleItem],
+    settings: Settings,
+    video_width: int,
+    video_height: int,
+    font_path: str,
+):
+    """Return positioned text clips for in-memory subtitle ``items``.
+
+    Each entry is passed through the cue splitter first, so entries that still
+    hold whole sentences are broken into short on-screen phrases instead of one
+    long block. Entries that are already short cues pass through unchanged.
+    """
     cues = split_segments_into_cues(
         [{"start": start, "end": end, "text": text} for (start, end), text in items],
         max_chars=settings.subtitle_max_chars,

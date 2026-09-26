@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stdout
-from typing import Optional
+from typing import List, Optional
 
 from moviepy import (
     CompositeAudioClip,
@@ -43,7 +43,11 @@ from .fonts import resolve_font_path
 from .layout import build_vertical_clip, needs_vertical_fit
 from .log import log
 from .music import build_music_audio, resolve_music_file
-from .subtitles import build_subtitle_clips
+from .subtitles import (
+    SubtitleItem,
+    build_subtitle_clips_from_items,
+    load_subtitles,
+)
 
 _DEFAULT_VIDEO_CODEC = "libx264"
 
@@ -225,46 +229,57 @@ def sibling_subtitle_path(input_path: str) -> str:
     return f"{stem}.srt"
 
 
-def _generate_subtitles(settings: Settings, input_path: str) -> str:
-    """Transcribe ``input_path`` with Whisper and return the written ``.srt``."""
+def _transcribe_items(settings: Settings, input_path: str) -> List[SubtitleItem]:
+    """Transcribe ``input_path`` with Whisper and return in-memory entries.
+
+    The result is kept in memory only — no per-file ``.srt`` is written — because
+    the caller burns the subtitles straight into the clip.
+    """
     from ..transcriber import transcribe
 
-    target = sibling_subtitle_path(input_path)
-    log.info("no subtitle file found; transcribing with Whisper")
-    transcript = transcribe(input_path, settings, cache_path=target)
-    if not transcript.get("segments"):
+    log.info("no subtitle file found; transcribing with Whisper (in memory)")
+    transcript = transcribe(input_path, settings, write_cache=False)
+    segments = transcript.get("segments") or []
+    if not segments:
         raise ProcessingError("Whisper produced no segments for this file.")
-    return target
+    return [
+        ((float(seg["start"]), float(seg["end"])), str(seg.get("text", "")).strip())
+        for seg in segments
+        if str(seg.get("text", "")).strip()
+    ]
 
 
-def _resolve_subtitle_file(
+def _resolve_subtitle_items(
     settings: Settings,
     input_path: str,
     subtitle_file: Optional[str],
-) -> str:
-    """Return the ``.srt`` to burn in, or ``""`` when subtitles are skipped.
+) -> List[SubtitleItem]:
+    """Return the in-memory subtitle entries to burn, or ``[]`` when skipped.
 
     ``subtitle_file`` (when given) is an explicit override used by the ``all``
-    pipeline, which slices a per-clip ``.srt`` out of the source transcript.
+    pipeline, which slices per-clip entries out of the source transcript.
     Otherwise ``SUBTITLE_SOURCE`` decides:
 
     * ``auto``    — an explicit ``SUBTITLE_FILE`` or a same-named ``.srt`` next
-      to the video; if neither exists, transcribe with Whisper;
+      to the video; if neither exists, transcribe with Whisper (in memory);
     * ``file``    — an explicit ``SUBTITLE_FILE`` or a same-named ``.srt``;
-    * ``whisper`` — always transcribe with Whisper;
+    * ``whisper`` — always transcribe with Whisper (in memory);
     * ``none``    — never burn subtitles.
+
+    Files are read for the ``file``/``auto`` sources; Whisper results are kept in
+    memory, so no per-video ``.srt`` is ever written.
     """
     if subtitle_file:
         path = settings.resolve(subtitle_file)
         if not os.path.isfile(path):
             raise ProcessingError(f"subtitle file not found: {subtitle_file!r}")
-        return path
+        return load_subtitles(path)
 
     source = (settings.subtitle_source or "auto").strip().lower()
 
     if source == "none":
         log.info("SUBTITLE_SOURCE=none; skipping subtitles")
-        return ""
+        return []
 
     if source == "file":
         candidate = settings.subtitle_file or sibling_subtitle_path(input_path)
@@ -275,21 +290,21 @@ def _resolve_subtitle_file(
                 "existing .srt, use SUBTITLE_SOURCE=auto/whisper, or disable "
                 "subtitles with SUBTITLE_SOURCE=none."
             )
-        return path
+        return load_subtitles(path)
 
     if source == "whisper":
-        return _generate_subtitles(settings, input_path)
+        return _transcribe_items(settings, input_path)
 
     if source == "auto":
         if settings.subtitle_file:
             explicit = settings.resolve(settings.subtitle_file)
             if os.path.isfile(explicit):
-                return explicit
+                return load_subtitles(explicit)
         sibling = sibling_subtitle_path(input_path)
         if os.path.isfile(sibling):
             log.info("using subtitle file next to the video: %s", sibling)
-            return sibling
-        return _generate_subtitles(settings, input_path)
+            return load_subtitles(sibling)
+        return _transcribe_items(settings, input_path)
 
     raise ProcessingError(
         f"unknown SUBTITLE_SOURCE {settings.subtitle_source!r}; "
@@ -415,6 +430,7 @@ def run(
     burn_subtitles: bool = True,
     add_music: bool = True,
     subtitle_file: Optional[str] = None,
+    subtitle_items: Optional[List[SubtitleItem]] = None,
 ) -> str:
     """Process one video and return the output path.
 
@@ -426,6 +442,9 @@ def run(
         burn_subtitles: whether to attempt the subtitle stage.
         add_music: whether to attempt the music stage.
         subtitle_file: explicit ``.srt`` to burn (overrides ``SUBTITLE_SOURCE``).
+        subtitle_items: in-memory subtitle entries to burn; when given they are
+            used directly and no ``.srt`` is read (the ``all`` pipeline passes the
+            per-clip entries sliced from the source transcript this way).
     """
     ffmpeg_binary = configure_ffmpeg(settings.ffmpeg_path)
 
@@ -441,11 +460,10 @@ def run(
     log.info("input video:  %s", source_path)
     log.info("output video: %s", target_path)
 
-    srt_path = (
-        _resolve_subtitle_file(settings, source_path, subtitle_file)
-        if burn_subtitles
-        else ""
-    )
+    if not burn_subtitles:
+        subtitle_items = []
+    elif subtitle_items is None:
+        subtitle_items = _resolve_subtitle_items(settings, source_path, subtitle_file)
 
     # --- colour / lens effects -------------------------------------------
     # Baked into the source first, so they affect the video but never the text
@@ -487,14 +505,14 @@ def run(
         # --- overlays: burned-in subtitles + banner ----------------------
         # The font is only needed when something textual is drawn (subtitles or
         # a text banner), so an image-only banner does not require one.
-        needs_font = bool(srt_path) or banner_kind(settings) == "text"
+        needs_font = bool(subtitle_items) or banner_kind(settings) == "text"
         font_path = resolve_font_path(settings) if needs_font else ""
 
         subtitle_clips = []
-        if srt_path:
-            log.info("burning subtitles from: %s", srt_path)
-            subtitle_clips = build_subtitle_clips(
-                srt_path, settings, final_width, final_height, font_path
+        if subtitle_items:
+            log.info("burning %d in-memory subtitle entries", len(subtitle_items))
+            subtitle_clips = build_subtitle_clips_from_items(
+                subtitle_items, settings, final_width, final_height, font_path
             )
             if subtitle_clips:
                 log.info("added %d subtitle clip(s)", len(subtitle_clips))

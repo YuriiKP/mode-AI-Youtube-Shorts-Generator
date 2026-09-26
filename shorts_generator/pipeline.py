@@ -13,7 +13,7 @@ and burned-in subtitles to every rendered short (the ``all`` command).
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .clipper import crop_highlights
 from .config import Settings
@@ -23,6 +23,60 @@ from .highlights import get_highlights, snap_highlights_to_transcript
 from .subtitles import find_video_files
 from .timing import start_timer
 from .transcriber import transcribe
+
+# How many boundary words to show per clip edge in the analysis log.
+_CUT_LOG_WORDS = 4
+
+
+def _boundary_words(
+    transcript: Dict,
+    start: float,
+    end: float,
+    *,
+    count: int = _CUT_LOG_WORDS,
+) -> Tuple[str, str]:
+    """Return the first and last ``count`` words spoken inside [start, end].
+
+    Words come from the transcript cues overlapping the window (no extra
+    Whisper pass), so the values mirror what will actually be cut.
+    """
+    parts: List[str] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            seg_start = float(segment["start"])
+            seg_end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seg_end <= start or seg_start >= end:
+            continue
+        text = str(segment.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    words = " ".join(parts).split()
+    if not words:
+        return "", ""
+    return " ".join(words[:count]), " ".join(words[-count:])
+
+
+def _log_cut_points(transcript: Dict, highlights: List[Dict]) -> None:
+    """Print each clip's window, duration and boundary words for analysis."""
+    for i, h in enumerate(highlights, 1):
+        try:
+            start = float(h["start_time"])
+            end = float(h["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        head, tail = _boundary_words(transcript, start, end)
+        print(
+            f"[cut] #{i}  {start:.2f}s -> {end:.2f}s  "
+            f"(длительность {end - start:.2f}s)  "
+            f"score={h.get('score')}  «{h.get('title', '')}»",
+            flush=True,
+        )
+        if head:
+            print(f"[cut]   начало ({start:.2f}s): «{head}»", flush=True)
+        if tail:
+            print(f"[cut]   конец  ({end:.2f}s): «{tail}»", flush=True)
 
 
 def _process_one(
@@ -76,6 +130,10 @@ def _process_one(
             end_padding=settings.clip_end_padding,
             max_end=float(transcript.get("duration", 0.0)) or None,
         )
+
+    # Analysis log: show what was actually selected for cutting — each clip's
+    # time window plus a few words from its start and end phrases.
+    _log_cut_points(transcript, top)
 
     with timer.stage("crop"):
         shorts = crop_highlights(

@@ -140,6 +140,7 @@ def transcribe(
     *,
     language: Optional[str] = None,
     cache_path: Optional[str] = None,
+    write_cache: bool = True,
 ) -> Dict:
     """Run faster-whisper on a local file, caching the result as ``.srt``.
 
@@ -149,11 +150,14 @@ def transcribe(
         language: ISO-639-1 code to force; defaults to ``settings.whisper_language``.
         cache_path: where to write the ``.srt`` cache (defaults to the video's
             folder / ``OUTPUT_DIR``).
+        write_cache: when False, no per-file ``.srt`` cache is written or read —
+            the transcript is returned in memory only (used when the caller burns
+            subtitles straight from the in-memory result).
     """
     language = language if language is not None else (settings.whisper_language or None)
 
     srt_path = _transcript_cache_path(media_path, settings, cache_path=cache_path)
-    if srt_path.exists():
+    if write_cache and srt_path.exists():
         source_mtime = os.path.getmtime(media_path)
         cache_mtime = srt_path.stat().st_mtime
         if cache_mtime >= source_mtime:
@@ -235,6 +239,11 @@ def transcribe(
         f"[transcribe] {len(transcript['segments'])} cues, {duration:.0f}s of audio",
         flush=True,
     )
-    srt_path = _write_srt_cache(media_path, transcript, settings, cache_path=cache_path)
-    print(f"[transcribe] wrote cache: {srt_path}", flush=True)
+    if write_cache:
+        srt_path = _write_srt_cache(
+            media_path, transcript, settings, cache_path=cache_path
+        )
+        print(f"[transcribe] wrote cache: {srt_path}", flush=True)
+    else:
+        print("[transcribe] cache disabled; keeping transcript in memory", flush=True)
     return transcript
