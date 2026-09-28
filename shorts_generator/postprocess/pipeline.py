@@ -3,8 +3,9 @@
 :func:`run` ties the stages together:
 
 1. bake the configured colour/lens effects (``SATURATION`` / ``SHARPNESS`` /
-   ``CHROMATIC_ABERRATION``) into the source with a single FFmpeg pass, so they
-   land on the video *only* — before any text is drawn;
+   ``CHROMATIC_ABERRATION``) and the ``SPEED`` change into the source with a
+   single FFmpeg pass, so the effects land on the video *only* — before any text
+   is drawn — and the audio is re-timed to match;
 2. resolve the subtitle source (an existing ``.srt`` next to the video, a given
    ``.srt``, or a Whisper transcription when none is found);
 3. re-frame the clip into the vertical frame, filling the empty area with a
@@ -37,7 +38,11 @@ from moviepy import (
 
 from ..config import Settings
 from .banner import banner_kind, build_banner_clips
-from .effects import build_filter_chain
+from .effects import (
+    build_filter_chain,
+    build_speed_audio_filter,
+    build_speed_video_filter,
+)
 from .ffmpeg import configure_ffmpeg
 from .fonts import resolve_font_path
 from .layout import build_vertical_clip, needs_vertical_fit
@@ -133,8 +138,14 @@ def _scrub_input(path: str, ffmpeg_binary: str) -> str:
     return temp_path
 
 
-def _apply_effects_pass(source_path: str, filter_chain: str, ffmpeg_binary: str) -> str:
-    """Bake the colour/lens effects into ``source_path`` with one FFmpeg pass.
+def _apply_effects_pass(
+    source_path: str,
+    filter_chain: str,
+    ffmpeg_binary: str,
+    *,
+    audio_filter: str = "",
+) -> str:
+    """Bake the colour/lens effects (and speed) into ``source_path`` in one pass.
 
     The effects must land on the video *only* — before MoviePy composites the
     subtitles and the banner on top — so rather than filtering the final encode
@@ -142,6 +153,10 @@ def _apply_effects_pass(source_path: str, filter_chain: str, ffmpeg_binary: str)
     pipeline. FFmpeg runs the filters in optimised, multithreaded C, so this
     stays far cheaper than touching every frame in Python. The intermediate is a
     high-quality x264 copy, so the extra encode generation is visually lossless.
+
+    ``audio_filter`` is the ``-af`` chain used to re-time the audio when the
+    playback speed changes (a no-op empty string in the common case, which keeps
+    the audio stream copied losslessly).
 
     Returns the temporary file path; the caller must delete it when done. On
     failure the temp file is removed and a :class:`ProcessingError` is raised.
@@ -165,8 +180,17 @@ def _apply_effects_pass(source_path: str, filter_chain: str, ffmpeg_binary: str)
         "-1",
         "-sn",
         "-dn",
-        "-vf",
-        filter_chain,
+    ]
+    if filter_chain:
+        cmd += ["-vf", filter_chain]
+    if audio_filter:
+        # Changing the playback speed means the audio has to be filtered too;
+        # re-encode it through the ``-af`` chain so it matches the video.
+        cmd += ["-af", audio_filter, "-c:a", "aac"]
+    else:
+        # Common path: leave the audio untouched (lossless copy).
+        cmd += ["-c:a", "copy"]
+    cmd += [
         "-c:v",
         _DEFAULT_VIDEO_CODEC,
         "-crf",
@@ -175,11 +199,13 @@ def _apply_effects_pass(source_path: str, filter_chain: str, ffmpeg_binary: str)
         "veryfast",
         "-pix_fmt",
         "yuv420p",
-        "-c:a",
-        "copy",
         temp_path,
     ]
-    log.info("applying video filters to the source: %s", filter_chain)
+    log.info(
+        "applying source filters — video: %s | audio: %s",
+        filter_chain or "-",
+        audio_filter or "-",
+    )
     try:
         _ = subprocess.run(
             cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
@@ -417,6 +443,25 @@ def _write_video(
         clip.write_videofile(output_path, codec=_DEFAULT_VIDEO_CODEC, **kwargs)
 
 
+def _scale_subtitle_items(
+    items: List[SubtitleItem], factor: float
+) -> List[SubtitleItem]:
+    """Scale cue timings by ``factor`` to match a playback-speed change.
+
+    A speed change re-times the whole clip, so cues sliced from the original
+    transcript must be compressed (``factor = 1 / SPEED``) to stay in sync with
+    the sped-up video. A ``factor`` of exactly ``1.0`` returns the input as-is.
+    """
+    if not items or factor == 1.0:
+        return items
+    scaled: List[SubtitleItem] = []
+    for (start, end), text in items:
+        new_start = max(0.0, float(start) * factor)
+        new_end = max(new_start, float(end) * factor)
+        scaled.append(((new_start, new_end), text))
+    return scaled
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -429,6 +474,7 @@ def run(
     *,
     burn_subtitles: bool = True,
     add_music: bool = True,
+    apply_picture: bool = True,
     subtitle_file: Optional[str] = None,
     subtitle_items: Optional[List[SubtitleItem]] = None,
 ) -> str:
@@ -441,6 +487,12 @@ def run(
             frame, music, encoding).
         burn_subtitles: whether to attempt the subtitle stage.
         add_music: whether to attempt the music stage.
+        apply_picture: whether to touch the *picture* at all — the colour/lens
+            effects, the ``SPEED`` change, the vertical re-framing and the
+            banner. When ``False`` only the requested stage (subtitles and/or
+            music) runs and the source video is passed through untouched, which
+            is what keeps the commands modular (e.g. ``music`` must add audio
+            only and never recolour or re-frame the video).
         subtitle_file: explicit ``.srt`` to burn (overrides ``SUBTITLE_SOURCE``).
         subtitle_items: in-memory subtitle entries to burn; when given they are
             used directly and no ``.srt`` is read (the ``all`` pipeline passes the
@@ -465,16 +517,37 @@ def run(
     elif subtitle_items is None:
         subtitle_items = _resolve_subtitle_items(settings, source_path, subtitle_file)
 
-    # --- colour / lens effects -------------------------------------------
+    # A speed change re-times the whole clip (baked in by the effects pass
+    # below), so compress the cue timings by the same factor to keep them in
+    # sync with the sped-up video. Only relevant when the picture pass runs.
+    speed = float(settings.speed)
+    if apply_picture and subtitle_items and abs(speed - 1.0) > 1e-9:
+        subtitle_items = _scale_subtitle_items(subtitle_items, 1.0 / speed)
+
+    # --- colour / lens effects + speed -----------------------------------
     # Baked into the source first, so they affect the video but never the text
-    # (subtitles/banner) that gets composited on top later. Skipped entirely
-    # when every effect is at its neutral value.
+    # (subtitles/banner) that gets composited on top later. A SPEED change is
+    # applied in the very same pass — on the audio too, via ``-af``. Skipped
+    # entirely when every effect is neutral and SPEED is 1 — and skipped
+    # wholesale when ``apply_picture`` is off, so a picture-free command (the
+    # ``music`` stage) leaves the source video exactly as it found it.
     working_path = source_path
     effects_input = ""
-    filter_chain = build_filter_chain(settings)
-    if filter_chain:
-        effects_input = _apply_effects_pass(source_path, filter_chain, ffmpeg_binary)
-        working_path = effects_input
+    filter_chain = ""
+    speed_audio = ""
+    if apply_picture:
+        filter_chain = build_filter_chain(settings)
+        speed_video = build_speed_video_filter(settings)
+        speed_audio = build_speed_audio_filter(settings)
+        if speed_video:
+            filter_chain = (
+                f"{filter_chain},{speed_video}" if filter_chain else speed_video
+            )
+        if filter_chain or speed_audio:
+            effects_input = _apply_effects_pass(
+                source_path, filter_chain, ffmpeg_binary, audio_filter=speed_audio
+            )
+            working_path = effects_input
 
     try:
         video_clip, scrubbed_input = _open_video(working_path, ffmpeg_binary)
@@ -498,14 +571,16 @@ def run(
         final_width, final_height = int(width), int(height)
 
         # --- vertical fit: blurred background fill -----------------------
-        if needs_vertical_fit(video_clip, settings):
+        if apply_picture and needs_vertical_fit(video_clip, settings):
             final_clip = build_vertical_clip(video_clip, settings)
             final_width, final_height = (int(value) for value in final_clip.size)
 
         # --- overlays: burned-in subtitles + banner ----------------------
         # The font is only needed when something textual is drawn (subtitles or
         # a text banner), so an image-only banner does not require one.
-        needs_font = bool(subtitle_items) or banner_kind(settings) == "text"
+        needs_font = bool(subtitle_items) or (
+            apply_picture and banner_kind(settings) == "text"
+        )
         font_path = resolve_font_path(settings) if needs_font else ""
 
         subtitle_clips = []
@@ -519,9 +594,11 @@ def run(
             else:
                 log.warning("no subtitle entries were rendered; skipping burn-in")
 
-        banner_clips = build_banner_clips(
-            settings, final_width, final_height, video_duration, font_path
-        )
+        banner_clips = []
+        if apply_picture:
+            banner_clips = build_banner_clips(
+                settings, final_width, final_height, video_duration, font_path
+            )
 
         overlays = [*subtitle_clips, *banner_clips]
         if overlays:

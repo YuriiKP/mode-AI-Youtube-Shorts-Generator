@@ -267,6 +267,17 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
         help="red/blue channel separation in pixels at the frame corner, "
         "0 disables the effect (default: 0)",
     )
+    parser.add_argument(
+        "--speed",
+        dest="speed",
+        type=float,
+        default=None,
+        metavar="N",
+        help="playback-speed multiplier: 1.0 keeps the original speed, values "
+        "above 1 speed the clip up (1.5 is 50%% faster) and values below 1 slow "
+        "it down (0.5 is half speed); the audio is re-timed to match "
+        "(default: 1.0)",
+    )
 
 
 def _add_json(parser: argparse.ArgumentParser) -> None:
@@ -330,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_io(music)
     _add_music_options(music)
-    _add_render_options(music)
+    # No picture render options here: the ``music`` command is audio-only and
+    # never recolours, re-frames or re-times the video, so advertising effects,
+    # banner or fit flags would be misleading (they would be silently ignored).
     _add_common(music)
 
     # subtitles -------------------------------------------------------------
@@ -610,8 +623,14 @@ def _apply_to_inputs(
     *,
     add_music: bool,
     burn_subtitles: bool,
+    apply_picture: bool = True,
 ) -> int:
-    """Run the post-processing engine over every input video."""
+    """Run the post-processing engine over every input video.
+
+    ``apply_picture`` is forwarded to the engine; when ``False`` it leaves the
+    source video untouched and performs only the requested subtitle/music stage,
+    which is what keeps the dedicated commands modular.
+    """
     from .postprocess.pipeline import run as postprocess_run
 
     timer = start_timer()
@@ -633,6 +652,7 @@ def _apply_to_inputs(
                 settings,
                 burn_subtitles=burn_subtitles,
                 add_music=add_music,
+                apply_picture=apply_picture,
             )
         print(f"[post]   -> {out_path}", flush=True)
     return 0
@@ -646,7 +666,11 @@ def cmd_music(settings: Settings, args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    return _apply_to_inputs(settings, add_music=True, burn_subtitles=False)
+    # The music command is audio-only: it must not recolour, re-frame or re-time
+    # the picture, so the picture stages are switched off.
+    return _apply_to_inputs(
+        settings, add_music=True, burn_subtitles=False, apply_picture=False
+    )
 
 
 def cmd_subtitles(settings: Settings, args: argparse.Namespace) -> int:

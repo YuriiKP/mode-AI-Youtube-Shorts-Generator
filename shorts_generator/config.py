@@ -381,6 +381,11 @@ class Settings:
     # Chromatic aberration strength, expressed as the approximate red/blue
     # channel separation in pixels at the corner of the frame; ``0`` disables it.
     chromatic_aberration: float = 0.0
+    # Playback-speed multiplier applied to both the video and its audio in the
+    # same FFmpeg pass as the colour effects: ``1.0`` (the default) keeps the
+    # original speed, values above ``1`` play the clip faster (``1.5`` is 50%
+    # faster) and values below ``1`` slow it down (``0.5`` is half speed).
+    speed: float = 1.0
 
     # Encoding -------------------------------------------------------------
     video_codec: str = "libx264"
@@ -477,6 +482,7 @@ _FLOAT_FIELDS = {
     "saturation",
     "sharpness",
     "chromatic_aberration",
+    "speed",
     "slide_transition_gap",
     "slide_range",
 }
@@ -655,6 +661,8 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("SHARPNESS must be zero or greater")
     if settings.chromatic_aberration < 0:
         raise ConfigError("CHROMATIC_ABERRATION must be zero or greater")
+    if settings.speed <= 0:
+        raise ConfigError("SPEED must be greater than 0")
 
 
 # ---------------------------------------------------------------------------

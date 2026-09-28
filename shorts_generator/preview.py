@@ -234,6 +234,12 @@ def render_preview_frames(
     os.makedirs(out_dir, exist_ok=True)
 
     filter_chain = build_filter_chain(settings)
+
+    # SPEED re-times the whole timeline (video and its audio), which a single
+    # still frame does not have, so it is intentionally ignored in a preview.
+    if abs(float(settings.speed) - 1.0) > 1e-9:
+        log.info("note: SPEED is ignored in the single-frame preview")
+
     count = max(1, int(count))
     written: List[str] = []
 

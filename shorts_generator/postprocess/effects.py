@@ -1,6 +1,6 @@
 """Configurable colour / lens effects, compiled into an FFmpeg filtergraph.
 
-Three independent, optional effects are exposed through the ``.env``:
+Several independent, optional effects are exposed through the ``.env``:
 
 * ``SATURATION`` — a multiplier on colour saturation. ``1.0`` keeps the source
   colours untouched, ``0`` renders greyscale and values above ``1`` boost
@@ -10,6 +10,11 @@ Three independent, optional effects are exposed through the ``.env``:
 * ``CHROMATIC_ABERRATION`` — the red and blue channels are shifted in opposite
   directions, so colours fringe at the edges of the frame. The value is the
   channel separation, in pixels; ``0`` disables it.
+* ``SPEED`` — a playback-speed multiplier applied to the video *and* its audio.
+  ``1.0`` keeps the original pace, values above ``1`` play the clip faster
+  (``1.5`` is 50% faster) and values below ``1`` slow it down (``0.5`` is half
+  speed). Unlike the colour effects it re-times the audio too, so it drives an
+  ``-af`` chain alongside the video filtergraph.
 
 Where the effects run matters. Processing every frame in Python (NumPy/OpenCV
 through ``image_transform``) is **single-threaded**: it holds one core while the
@@ -23,10 +28,11 @@ enabling an effect costs a few milliseconds per frame instead of tens of them,
 and the per-frame Python cost is gone entirely.
 
 The graph uses only widely available filters (``eq`` / ``unsharp`` /
-``rgbashift``), so it works with any standard FFmpeg build. Because the pre-pass
-rewrites the source *before* anything is composited on top, the effects land on
-the video only — the subtitles and the banner are drawn afterwards and stay
-crisp. When all three values are neutral the graph is empty and the pre-pass is
+``rgbashift``, plus ``setpts`` / ``atempo`` for ``SPEED``), so it works with any
+standard FFmpeg build. Because the pre-pass rewrites the source *before*
+anything is composited on top, the effects land on the video only — the
+subtitles and the banner are drawn afterwards and stay crisp. When the colour
+values are neutral and ``SPEED`` is ``1`` the graph is empty and the pre-pass is
 skipped entirely.
 """
 
@@ -37,6 +43,15 @@ from ..config import Settings
 # Values closer than this to 1.0 count as "no saturation change", so the default
 # of ``1.0`` never contributes a filter.
 _SATURATION_EPSILON = 1e-6
+
+# Values closer than this to 1.0 count as "no speed change", so the default of
+# ``1.0`` never contributes a filter.
+_SPEED_EPSILON = 1e-6
+
+# ``atempo`` only accepts a factor in this range per instance; a speed outside
+# it is built by chaining several ``atempo`` filters.
+_ATEMPO_MIN = 0.5
+_ATEMPO_MAX = 2.0
 
 
 def _fmt(value: float) -> str:
@@ -86,4 +101,59 @@ def effects_enabled(settings: Settings) -> bool:
     return bool(build_filter_chain(settings))
 
 
-__all__: list[str] = ["build_filter_chain", "effects_enabled"]
+def _build_atempo_chain(speed: float) -> str:
+    """Return an ``atempo`` chain that scales the audio by ``speed``.
+
+    ``atempo`` only covers ``0.5``–``2.0`` per instance, so a speed outside that
+    range (e.g. ``3.0`` or ``0.25``) is split across several chained filters,
+    each kept inside the supported range.
+    """
+    parts: list[str] = []
+    remaining = float(speed)
+    while remaining > _ATEMPO_MAX + _SPEED_EPSILON:
+        parts.append(f"atempo={_fmt(_ATEMPO_MAX)}")
+        remaining /= _ATEMPO_MAX
+    while remaining < _ATEMPO_MIN - _SPEED_EPSILON:
+        parts.append(f"atempo={_fmt(_ATEMPO_MIN)}")
+        remaining /= _ATEMPO_MIN
+    parts.append(f"atempo={_fmt(remaining)}")
+    return ",".join(parts)
+
+
+def build_speed_video_filter(settings: Settings) -> str:
+    """Return the video filter that scales playback speed, or ``""``.
+
+    ``setpts=PTS/SPEED`` compresses the frame timestamps for a speed above
+    ``1`` (the clip plays faster) and stretches them below it; at ``1.0`` there
+    is nothing to do and an empty string is returned.
+    """
+    speed = float(settings.speed)
+    if abs(speed - 1.0) <= _SPEED_EPSILON:
+        return ""
+    return f"setpts=PTS/{_fmt(speed)}"
+
+
+def build_speed_audio_filter(settings: Settings) -> str:
+    """Return the audio filter that scales playback speed, or ``""``.
+
+    Uses an ``atempo`` chain so the audio is re-timed by the same factor as the
+    video and never slips out of sync.
+    """
+    speed = float(settings.speed)
+    if abs(speed - 1.0) <= _SPEED_EPSILON:
+        return ""
+    return _build_atempo_chain(speed)
+
+
+def speed_enabled(settings: Settings) -> bool:
+    """Return ``True`` when the playback speed differs from ``1.0``."""
+    return bool(build_speed_video_filter(settings))
+
+
+__all__: list[str] = [
+    "build_filter_chain",
+    "build_speed_audio_filter",
+    "build_speed_video_filter",
+    "effects_enabled",
+    "speed_enabled",
+]
