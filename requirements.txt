@@ -3,7 +3,7 @@ yt-dlp>=2024.1.1
 faster-whisper>=1.0.0
 openai>=1.0.0
 google-genai>=1.0.0
-opencv-python==4.8
+opencv-python>=4.8,<5
 # torch is only needed for CUDA Whisper; CPU works without it.
 # torch>=2.0
 
@@ -15,3 +15,13 @@ numpy>=1.25
 # Scene/transition detection for the SLIDE_EFFECT pan (optional at runtime:
 # scene_transitions.py falls back to OpenCV when this is not installed).
 scenedetect>=0.6,<0.9
+
+# Publishing (python main.py publish ...): browser automation runs on the ShardX
+# anti-detect engine via its Python SDK. It downloads a patched Chromium engine
+# from the CDN on first use; no separate `patchright install` or Google Chrome is
+# required.
+shardx
+
+# The ShardX SDK drives its browser through patchright over CDP, so patchright is
+# required at runtime.
+patchright>=1.49

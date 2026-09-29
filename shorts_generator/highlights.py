@@ -118,9 +118,10 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 - Укажи "clip_type" — короткий тип момента (например: shock, conflict, reveal, joke, emotional).
 - Объясни одним предложением, почему этот клип виральный ("virality_reason").
 - Дай "description" — короткое цепляющее описание клипа на 1-2 предложения для заполнения при публикации на площадках (YouTube Shorts, TikTok, Instagram Reels). Пиши цепляюще и по сути, как подпись к видео, без хэштегов, эмодзи и markdown.
+- Дай "tags" — массив из 3–5 коротких хэштегов (без символа #), точно по теме клипа, для продвижения на YouTube Shorts и TikTok. Пиши теги латиницей, при необходимости добавь тег на языке контента. Пример: ["anime","shorts","аниме"].
 
 Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
-{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","title":"string","description":"string","start_time":float,"end_time":float,"score":int,"laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string","virality_reason":"string"}}]}}"""
+{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","title":"string","description":"string","tags":["string"],"start_time":float,"end_time":float,"score":int,"laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string","virality_reason":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200  # 20-min chunks for long videos
@@ -181,6 +182,29 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _normalize_tags(value: object) -> List[str]:
+    """Normalize a model-provided ``tags`` value into clean hashtag words.
+
+    Accepts a list/tuple/set or a single comma/semicolon/space separated string,
+    strips a leading ``#`` from each item, drops empties and removes duplicates
+    while preserving order, so the value is safe to hand straight to the
+    publisher (which turns each tag into ``#tag``).
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = [str(item) for item in value]
+    else:
+        raw = str(value).replace(",", " ").replace(";", " ").split()
+
+    tags: List[str] = []
+    for item in raw:
+        tag = item.strip().lstrip("#").strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
 def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
     """Normalize model output into the expected shape; skip invalid entries."""
     if not isinstance(raw_highlights, list):
@@ -207,6 +231,7 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
             {
                 "title": str(item.get("title") or "Untitled Highlight").strip(),
                 "description": str(item.get("description") or "").strip(),
+                "tags": _normalize_tags(item.get("tags")),
                 "clip_type": str(item.get("clip_type") or "").strip().lower(),
                 "start_time": start,
                 "end_time": end,
@@ -358,8 +383,8 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nВАЖНО: верни ТОЛЬКО валидный JSON: на верхнем уровне поля content_type, density и массив 'highlights'."
-                + " Каждый элемент обязан содержать: clip_type, title, description, start_time, end_time, score,"
-                + " laugh_score, cringe_score, intrigue_score, hook_sentence, punchline, virality_reason."
+                + " Каждый элемент обязан содержать: clip_type, title, description, tags (массив коротких хэштегов без #),"
+                + " start_time, end_time, score, laugh_score, cringe_score, intrigue_score, hook_sentence, punchline, virality_reason."
                 + " Без markdown-ограждений, без комментариев."
             )
 

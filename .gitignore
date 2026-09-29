@@ -14,3 +14,9 @@ music/
 fonts/
 banner/
 video/
+
+# Publisher: browser profiles hold cookies/logins (secrets) and the upload
+# history database is machine-local.
+browser_profiles/
+publish_state.sqlite3
+publish_state.sqlite3-*

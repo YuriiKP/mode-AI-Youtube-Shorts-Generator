@@ -343,12 +343,130 @@ Time spent:
 #1
 Название:    Почему никто не говорит об этом
 Описание:    Разбираем неочевидный момент, который меняет взгляд на тему. Коротко и по делу.
+Теги:        #anime #shorts #аниме
 Файл:        short_01_talk.mp4
 ```
 
 Копируйте название и описание прямо отсюда — вводить их вручную не нужно.
-Те же поля доступны в JSON-результате (`--output-json`): у каждого шортса есть
-ключи `title` и `description`.
+Вместе с текстовой шпаргалкой рядом пишется машиночитаемый
+`output/shorts_info.json` (те же поля: `title`, `description`, `tags`, `file`, ...).
+Именно его читает команда `publish` (см. ниже), поэтому для публикации ничего
+вводить руками не нужно. У каждого шортса теперь есть и **теги** (хэштеги) — их
+LLM придумывает вместе с хайлайтом, а в JSON они лежат в ключе `tags`.
+Те же поля доступны и в JSON-результате пайплайна (`--output-json`).
+
+## Публикация (YouTube / TikTok)
+
+Команда `publish` загружает готовые клипы на **YouTube** (через YouTube Studio)
+и **TikTok** (через TikTok Studio) автоматизацией браузера. Всё работает через
+**постоянные браузерные профили**: профиль — это именованный каталог Chromium, в
+котором лежат куки/логины сразу для всех платформ. Логин делается один раз,
+дальше загрузка идёт без участия человека.
+
+Логика загрузки портирована из проекта
+[`social-auto-upload`](https://github.com/dreammis/social-auto-upload).
+
+Браузерная автоматизация работает на анти-детект движке
+[ShardX](https://github.com/ProxyShard/ShardBrowser) через его Python SDK:
+спуфинг отпечатка на уровне движка (WebGL/WebGPU/Client Hints/TLS/шрифты), свой
+Chromium и куки в профиле SDK; установка Chrome не нужна.
+
+### Установка браузерного стека
+
+```bash
+pip install shardx               # движок скачается с CDN при первом запуске
+```
+
+Отдельно ставить Chrome/Chromium не нужно: ShardX запускает собственный браузер
+и спуфит отпечаток внутри движка, а куки и отпечаток хранит сам профиль SDK (id
+профиля запоминается в `meta.json` рядом с профилем).
+
+### Профили и авторизация
+
+```bash
+# открыть браузер профиля (создаётся автоматически) и залогиниться в YouTube и TikTok
+python main.py publish manual --profile profile_1
+
+# только страница логина TikTok; несколько профилей сразу — через запятую
+python main.py publish manual --profile profile_1 --platform tiktok
+python main.py publish manual --profile profile_1,anime_ru
+
+# проверить, живы ли куки; список профилей и история загрузок
+python main.py publish check --profile profile_1
+python main.py publish profiles
+```
+
+В ручном режиме скрипт открывает окно и просто ждёт: логинитесь, настраиваете что
+нужно, закрываете окно — **все куки профиля сохраняются автоматически**.
+
+### Загрузка
+
+```bash
+# все клипы × все профили × обе платформы
+python main.py publish upload
+
+# только YouTube и только выбранные профили
+python main.py publish upload --profiles profile_1,anime_ru --platforms youtube
+
+# что будет загружено (браузер не открывается)
+python main.py publish upload --dry-run
+
+# один файл, unlisted, с паузой 60 c между загрузками
+python main.py publish upload --video output/short_01_talk.mp4 --visibility unlisted --delay 60
+
+# повторно залить всё / только то, что упало
+python main.py publish upload --rerun
+python main.py publish upload --rerun-failed
+```
+
+Клипы по умолчанию берутся из `PUBLISH_OUTPUT_DIR` (или `--output-dir`) вместе с
+`shorts_info.json`; заголовок, описание и теги берутся оттуда. Уже опубликованное в
+конкретный (профиль, платформа) повторно не заливается — учёт ведётся в SQLite
+(`PUBLISH_DB`). Флаги выбора: `--profiles all|p1,p2`, `--platforms all|youtube|tiktok`,
+`--only 1,short_03`, `--limit N`.
+
+### Распределение клипов и расписание
+
+Клипы **не дублируются между профилями**: они раздаются по кругу (`clip_i -> профиль_(i mod N)`).
+Один и тот же клип попадает в один профиль, но публикуется там на выбранных площадках (YouTube и TikTok).
+
+* `PUBLISH_MODE=distribute` — клипы раздаются по профилям по кругу, публикация **сразу**;
+* `PUBLISH_MODE=schedule` — то же распределение, но каждый клип встаёт в **расписание**.
+
+В режиме `schedule` длина списка `PUBLISH_SCHEDULE` задаёт, **сколько клипов публикует каждый профиль**
+(значение *r* — время *r*-го клипа этого профиля). Пример: два профиля и
+`PUBLISH_SCHEDULE=2026-04-01T10:00, 2026-04-01T18:00` -> каждый профиль выложит по 2 клипа в 10:00 и 18:00.
+Если клипов меньше, чем `профили x слоты`, выкладывается сколько есть (с предупреждением в логе).
+Время — в часовом поясе канала YouTube (TikTok — локальное сервера). Флаги на один запуск: `--mode`, `--schedule`.
+
+### Настройки (`.env`)
+
+```env
+PUBLISH_MODE=distribute                # distribute | schedule (как клипы распределяются по профилям)
+PUBLISH_SCHEDULE=                      # ISO-даты для schedule: 2026-04-01T10:00, 2026-04-01T18:00
+PUBLISH_PROFILE_DIR=browser_profiles   # где живут профили (в профиле — куки)
+PUBLISH_DB=publish_state.sqlite3       # история загрузок / защита от дублей
+PUBLISH_OUTPUT_DIR=output              # откуда брать клипы и shorts_info.json
+PUBLISH_HEADLESS=false                 # для загрузки окно лучше оставлять видимым
+PUBLISH_PROXY=                         # например http://127.0.0.1:7890 (для YouTube/TikTok из РФ)
+PUBLISH_TAGS=anime,shorts              # хэштеги по умолчанию, если у клипа их нет
+PUBLISH_VISIBILITY=public              # public | unlisted | private (YouTube)
+PUBLISH_YT_PLAYLIST=                   # необязательный плейлист YouTube
+PUBLISH_DELAY=30                       # пауза между загрузками, сек
+
+# Настройки движка shardx (анти-детект движок ShardX, по умолчанию):
+PUBLISH_SHARDX_TEMPLATE=               # id шаблона отпечатка (win-rtx4060, mac-m1-air13, ...); "" -> случайный
+PUBLISH_SHARDX_PLATFORM=Windows        # Windows | macOS | Linux (для случайного шаблона)
+PUBLISH_SHARDX_CACHE_DIR=              # каталог кэша SDK; "" -> по умолчанию
+PUBLISH_SHARDX_SCREEN_MODE=            # profile | cap_to_host | use_host; "" -> авто
+PUBLISH_SHARDX_RANDOMIZE=false         # пере-рандомизировать CPU/RAM/версию платформы
+PUBLISH_SHARDX_NOISE=                  # canvas,webgl,audio,client_rects,sensors,fonts
+PUBLISH_SHARDX_WEBRTC=auto             # auto | tcp_only | block
+PUBLISH_SHARDX_LANGUAGE=en-US          # язык браузера: en-US | ru-RU | "" ("" -> SDK берёт из гео)
+```
+
+Каталог `browser_profiles/` содержит куки, поэтому он в `.gitignore`. Любой флаг
+команды перекрывает значение из `.env` на один запуск.
 
 ## Python API
 
@@ -369,7 +487,7 @@ print(result["timings"]["total_seconds"], "seconds total")
 main.py                     точка входа CLI
 .env.example                единый шаблон настроек
 shorts_generator/
-├── cli.py                  подкоманды (clip / transcribe / music / subtitles / all)
+├── cli.py                  подкоманды (clip / transcribe / music / subtitles / all / publish)
 ├── config.py               единый загрузчик .env -> Settings
 ├── pipeline.py             оркестратор + публичный API
 ├── downloader.py           скачивание через yt-dlp
@@ -383,6 +501,17 @@ shorts_generator/
 ├── preview.py              тестовый кадр для подбора картинки (команда preview)
 ├── timing.py                замер времени по этапам (download/transcribe/...)
 └── postprocess/            движок вшивания (субтитры + музыка + баннер + вертикальный кадр + эффекты)
+
+publisher/                  публикация готовых клипов на YouTube / TikTok
+├── cli.py                  подкоманды publish (manual / check / upload / profiles)
+├── config.py               загрузка PUBLISH_* из .env
+├── publish.py              оркестрация: профили × платформы × клипы, отчёт
+├── session.py              запуск браузера ShardX + постоянный профиль (куки)
+├── profile.py              именованные профили, блокировка, meta.json
+├── platforms/              адаптеры площадок (youtube.py, tiktok.py)
+├── source.py               чтение shorts_info.json / .txt / папки
+├── model.py                модель Short (title / description / tags / file)
+└── state.py                SQLite: история и защита от дублей
 ```
 
 ## Устранение неполадок
