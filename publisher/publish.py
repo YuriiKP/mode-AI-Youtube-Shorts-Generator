@@ -481,37 +481,25 @@ async def run_upload(
                         if not platform_jobs:
                             continue
 
-                        # Verify the login once per (profile, platform).
-                        try:
-                            logged_in = await module.check(context, cfg, log)
-                        except Exception as exc:  # noqa: BLE001
-                            logged_in = False
-                            check_error = str(exc)
-                        else:
-                            check_error = ""
+                        profile.add_platform(module.NAME)
 
-                        if not logged_in:
-                            reason = check_error or "not logged in"
-                            log.warning(
-                                "%s: %s — skipping. Run: python main.py publish "
-                                "manual --profile %s",
-                                profile.name,
-                                reason,
-                                profile.name,
-                            )
-                            for job in platform_jobs:
+                        # The login is verified by the upload itself, on the very
+                        # tab it drives, so no separate "check" tab is opened and
+                        # closed first. When that first job reports an expired
+                        # session, the platform's remaining clips are skipped
+                        # with the same reason instead of being retried.
+                        login_error = ""
+
+                        for job in platform_jobs:
+                            if login_error:
                                 report.add(
                                     profile.name,
                                     module.NAME,
                                     job.short.name,
                                     UploadStatus.SKIPPED,
-                                    reason,
+                                    login_error,
                                 )
-                            continue
-
-                        profile.add_platform(module.NAME)
-
-                        for job in platform_jobs:
+                                continue
                             short = job.short
                             if not short.exists:
                                 report.add(
@@ -602,6 +590,23 @@ async def run_upload(
                                     short.name,
                                     UploadStatus.OK,
                                     result.url or result.video_id or "published",
+                                )
+                            elif result is not None and result.auth_required:
+                                login_error = result.error or "not logged in"
+                                log.warning(
+                                    "%s: %s — skipping the remaining clips. "
+                                    "Run: python main.py publish manual "
+                                    "--profile %s",
+                                    profile.name,
+                                    login_error,
+                                    profile.name,
+                                )
+                                report.add(
+                                    profile.name,
+                                    module.NAME,
+                                    short.name,
+                                    UploadStatus.SKIPPED,
+                                    login_error,
                                 )
                             else:
                                 state.record(

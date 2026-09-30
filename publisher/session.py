@@ -51,6 +51,35 @@ SITE_URLS = {
 # ---------------------------------------------------------------------------
 
 
+async def _discard_restored_pages(context) -> None:
+    """Drop the tabs the browser restored from its previous session.
+
+    The ShardX (Chromium) browser reopens the last session's tabs on launch, so
+    a run can start with the previous TikTok/YouTube page already open. The
+    automation opens its own tabs, so those leftovers only pile up; the extras
+    are closed here and the last remaining tab is blanked.
+
+    One tab is deliberately kept: closing the very last tab closes the browser
+    window, after which the next ``new_page()`` fails with "Failed to open a new
+    tab". Leaving an ``about:blank`` keeps a live target without showing a stale
+    platform page. Best-effort: cleanup never fails the run.
+    """
+    try:
+        pages = list(context.pages)
+    except Exception:  # noqa: BLE001 - nothing to clean up
+        return
+    for page in pages[1:]:
+        try:
+            await page.close()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    if pages:
+        try:
+            await pages[0].goto("about:blank", wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+
+
 @asynccontextmanager
 async def open_profile_context(
     cfg: PublishConfig,
@@ -80,6 +109,7 @@ async def open_profile_context(
 
     with lock:
         async with shardx_backend.open(cfg, profile, headless=use_headless) as context:
+            await _discard_restored_pages(context)
             yield context
 
 

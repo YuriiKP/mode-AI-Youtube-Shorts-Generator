@@ -403,7 +403,8 @@ async def upload(
         if "accounts.google.com" in current or "signin" in current.lower():
             return UploadResult.failure(
                 "YouTube login expired — run: "
-                "python main.py publish manual --profile <name>"
+                "python main.py publish manual --profile <name>",
+                auth_required=True,
             )
 
         # 1) choose the video file -------------------------------------------------

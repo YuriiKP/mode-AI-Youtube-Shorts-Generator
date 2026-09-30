@@ -38,14 +38,21 @@ class UploadResult:
     video_id: str = ""
     #: Human-readable failure reason (empty when ``ok`` is true).
     error: str = ""
+    #: True when the failure was an expired/missing login, so the caller can
+    #: skip this platform's remaining clips instead of retrying each one.
+    auth_required: bool = False
 
     @classmethod
     def success(cls, url: str = "", video_id: str = "") -> "UploadResult":
         return cls(ok=True, url=url, video_id=video_id)
 
     @classmethod
-    def failure(cls, error: str) -> "UploadResult":
-        return cls(ok=False, error=str(error).strip() or "unknown error")
+    def failure(cls, error: str, *, auth_required: bool = False) -> "UploadResult":
+        return cls(
+            ok=False,
+            error=str(error).strip() or "unknown error",
+            auth_required=auth_required,
+        )
 
 
 @runtime_checkable

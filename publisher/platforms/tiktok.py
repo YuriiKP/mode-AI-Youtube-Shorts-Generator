@@ -29,7 +29,7 @@ from typing import Tuple
 from .. import human
 from ..log import log as _default_log
 from ..model import Short
-from .base import UploadResult, clip_error, page_url
+from .base import UploadResult, clip_error, page_url, trim
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -55,10 +55,38 @@ _UPLOAD_IFRAME = '[data-tt="Upload_index_iframe"]'
 _MAX_UPLOAD_POLLS = 300
 _POLL_INTERVAL_SECONDS = 2
 
+# TikTok's caption box accepts ~2200 characters. The title and the description
+# are trimmed to leave room for the hashtags that are typed after them, so the
+# whole caption stays within the limit.
+_CAPTION_LIMIT = 2200
+
 # Matches TikTok's generated widget class names, e.g.
 # ``tiktok-xyz-SelectFormContainer``.
 _SELECT_FORM_RE = re.compile(r"tiktok-.*-SelectFormContainer.*")
 _VIDEO_ID_RE = re.compile(r"video/(\d+)")
+
+# Publishing: how many "Post" presses to attempt, and how long (ms) to wait for
+# the redirect to the content list after each one.
+_PUBLISH_ATTEMPTS = 60
+_PUBLISH_POLL_MS = 3000
+
+# A modal shown instead of publishing the clip (e.g. TikTok refusing a post as
+# an account violation). Its presence means "the post was not created".
+_BLOCKING_MODAL = (
+    ".account-violation-modal, div.common-modal:has-text('Post not created')"
+)
+
+# The upload form's primary action button. It reads "Post" for an immediate
+# post, but switches to "Schedule" once the "Schedule" tab is selected, so the
+# code has to match whichever is on screen.
+_ACTION_BUTTON = (
+    'div.button-group > button:has-text("Post"), '
+    'div.button-group > button:has-text("Schedule")'
+)
+
+# TikTok's onboarding tour renders this overlay; it intercepts pointer events
+# and blocks every click, so it is detached before any interaction.
+_JOYRIDE_PORTAL = "#react-joyride-portal"
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +94,35 @@ _VIDEO_ID_RE = re.compile(r"video/(\d+)")
 # ---------------------------------------------------------------------------
 
 
-async def _change_language(page) -> None:
-    """Force the TikTok UI into English so the text selectors keep matching."""
+async def _is_english_ui(page) -> bool:
+    """Best-effort: is the current TikTok UI in English?
+
+    TikTok keeps the chosen language in the account, so the answer holds across
+    pages. ``<html lang>`` reflects the rendered language; the "More" nav label
+    (present on the main site) is used as a fallback.
+    """
+    try:
+        lang = await page.evaluate("document.documentElement.lang || ''") or ""
+        if lang.strip():
+            return lang.strip().lower().startswith("en")
+    except Exception:  # noqa: BLE001 - fall back to the DOM check
+        pass
+    try:
+        menu = page.locator('[data-e2e="nav-more-menu"]')
+        if await menu.count():
+            return ((await menu.first.text_content()) or "").strip() == "More"
+    except Exception:  # noqa: BLE001 - treat an unreadable menu as "not set"
+        pass
+    return False
+
+
+async def _pick_english_language(page) -> None:
+    """Switch the account's UI language to English via the main-site menu.
+
+    The language menu only exists on the main site (www.tiktok.com), not on the
+    Studio pages, so this navigates there, opens the menu and selects
+    "English (US)". Best-effort: failures are ignored.
+    """
     try:
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await page.wait_for_selector('[data-e2e="nav-more-menu"]', timeout=15000)
@@ -75,16 +130,8 @@ async def _change_language(page) -> None:
     except Exception:  # noqa: BLE001 - the UI is left as-is when this fails
         return
 
-    menu = page.locator('[data-e2e="nav-more-menu"]')
     try:
-        label = (await menu.text_content()) or ""
-        if label.strip() == "More":
-            return  # already English
-    except Exception:  # noqa: BLE001 - treat an unreadable menu as "not set"
-        pass
-
-    try:
-        await human.click(page, menu)
+        await human.click(page, page.locator('[data-e2e="nav-more-menu"]'))
         await human.click(page, page.locator('[data-e2e="language-select"]'))
         await human.click(
             page,
@@ -96,6 +143,23 @@ async def _change_language(page) -> None:
         pass
 
 
+async def _ensure_english_ui(page, url: str) -> None:
+    """Open ``url`` and make sure the page is shown in English.
+
+    The uploader matches English labels ("Select video", "Post"). Instead of
+    always detouring through the main site to read the language menu, the
+    language of the page we are already on is checked first, and the switch only
+    happens when the UI is not English — after which ``url`` is reopened.
+    """
+    await page.goto(url, wait_until="domcontentloaded")
+    await human.wait_ready(page)
+    if await _is_english_ui(page):
+        return
+    await _pick_english_language(page)
+    await page.goto(url, wait_until="domcontentloaded")
+    await human.wait_ready(page)
+
+
 async def _choose_base_locator(page):
     """Return the locator scope holding the upload form (frame or body)."""
     if await page.locator(_UPLOAD_IFRAME).count():
@@ -103,9 +167,35 @@ async def _choose_base_locator(page):
     return page.locator("body")
 
 
-async def _add_title_and_tags(base, page, title: str, tags) -> None:
-    """Type the title and hashtags into TikTok's rich-text caption editor."""
+async def _dismiss_onboarding(page) -> None:
+    """Remove TikTok's onboarding (react-joyride) overlay if it is present.
+
+    The tour darkens the page with a spotlight and, on this rollout, has no
+    tooltip or buttons — there is nothing to click to close it. It appears when
+    the upload page loads and again once a file has been chosen, covering the
+    caption box and the buttons, so a click would land on the overlay instead of
+    the page. Detaching the portal node is the only reliable way to get rid of
+    it. Best-effort: any failure is ignored.
+    """
+    try:
+        await page.evaluate(
+            "(sel) => document.querySelector(sel)?.remove()", _JOYRIDE_PORTAL
+        )
+    except Exception:  # noqa: BLE001 - the tour is optional; never fail on it
+        pass
+
+
+async def _add_title_and_tags(base, page, title: str, description: str, tags) -> None:
+    """Type the caption (title + description) and hashtags into the editor.
+
+    TikTok keeps the whole caption — title, description and hashtags — in a
+    single rich-text box. The clip's description used to be dropped, so only the
+    title and the hashtags reached the site; here the title and the description
+    go on separate lines, and each hashtag is typed with a trailing space so
+    TikTok turns it into a chip.
+    """
     editor = base.locator("div.public-DraftEditor-content")
+    await editor.wait_for(state="visible", timeout=30_000)
     await human.click(page, editor)
 
     # Clear whatever placeholder/prefill is already there.
@@ -115,16 +205,34 @@ async def _add_title_and_tags(base, page, title: str, tags) -> None:
     await page.keyboard.press("End")
     await human.pause(page, 700, 1400)
 
-    if title.strip():
-        await page.keyboard.insert_text(title.strip())
+    # The hashtags are appended after the caption, so reserve room for them and
+    # keep the whole caption within TikTok's limit.
+    budget = max(0, _CAPTION_LIMIT - sum(len(tag) + 2 for tag in tags))
+    title_text = trim(title, budget)
+    description_text = trim(description, max(0, budget - len(title_text) - 1))
+
+    wrote_line = False
+    if title_text:
+        await page.keyboard.insert_text(title_text)
+        wrote_line = True
         await human.pause(page, 800, 1500)
+
+    if description_text:
+        if wrote_line:
+            await page.keyboard.press("End")
+            await page.keyboard.press("Enter")
+        await page.keyboard.insert_text(description_text)
+        wrote_line = True
+        await human.pause(page, 800, 1500)
+
+    if wrote_line:
         await page.keyboard.press("End")
         await page.keyboard.press("Enter")
 
     for tag in tags:
         await page.keyboard.press("End")
         await human.pause(page, 700, 1400)
-        # Type as "#tag " then remove the trailing space so TikTok registers the
+        # Type as "#tag " then drop the extra space so TikTok registers the
         # hashtag chip without leaving a dangling space behind.
         await page.keyboard.insert_text("#" + tag + " ")
         await page.keyboard.press("Space")
@@ -134,12 +242,15 @@ async def _add_title_and_tags(base, page, title: str, tags) -> None:
 
 
 async def _detect_upload_status(base, page, file_path: str, logger) -> bool:
-    """Wait until the file finished uploading (the "Post" button enables).
+    """Wait until the file finished uploading (the "Post"/"Schedule" button enables).
 
-    While waiting, recover once from a stalled/errored transfer by re-selecting
-    the file if the site shows its "Select file" error button.
+    The form's primary button reads "Post" for an immediate post and "Schedule"
+    once the "Schedule" tab is selected; either one becoming enabled means the
+    transfer is done. While waiting, recover once from a stalled/errored
+    transfer by re-selecting the file if the site shows its "Select file" error
+    button.
     """
-    post_button = base.locator('div.button-group > button:has-text("Post")').first
+    post_button = base.locator(_ACTION_BUTTON).first
     retried = False
 
     for _ in range(_MAX_UPLOAD_POLLS):
@@ -240,33 +351,76 @@ async def _set_schedule_time(base, page, schedule_at) -> bool:
         return False
 
 
-async def _click_publish(base, page, logger) -> bool:
-    """Click "Post" and wait for the confirmation (redirect to the content list)."""
-    publish_button = base.locator("div.button-group button").nth(0)
-    for attempt in range(60):
+async def _close_blocking_modal(base, page) -> bool:
+    """Dismiss a "the post was not created" modal; return whether one was found.
+
+    TikTok sometimes refuses a post and shows a modal (e.g. an account-violation
+    dialog) instead of redirecting to the content list. Detecting it lets the
+    caller stop retrying and report a real failure instead of waiting forever.
+    """
+    modal = base.locator(_BLOCKING_MODAL)
+    try:
+        if not await modal.count():
+            return False
+    except Exception:  # noqa: BLE001 - absence means "no block"
+        return False
+    try:
+        close = base.locator(".close-modal-btn").first
+        if await close.count():
+            await human.click(page, close)
+    except Exception:  # noqa: BLE001 - closing is best-effort
+        pass
+    return True
+
+
+async def _click_publish(base, page, logger) -> Tuple[bool, str]:
+    """Press "Post", accept the "Post now" dialog, and wait for the outcome.
+
+    Returns ``(True, "")`` once TikTok redirects to the content list, otherwise
+    ``(False, reason)``. TikTok does not publish on the first press: it opens a
+    confirmation dialog (``common-modal-confirm-modal``, buttons "Cancel" /
+    "Post now") and only posts once the primary button is pressed, which this
+    does. A refused post shows a modal instead of the redirect and is reported
+    as a failure so the run can move on.
+    """
+    # Target the buttons by label/role instead of position: the button group also
+    # holds "Discard", so an index-based pick could hit the wrong one.
+    publish_button = base.locator(_ACTION_BUTTON).first
+    confirm_button = base.locator(
+        "div.common-modal-confirm-modal button.TUXButton--primary"
+    ).first
+    for attempt in range(_PUBLISH_ATTEMPTS):
         try:
             if await publish_button.count():
                 # The first press is the real one: glide the cursor onto "Post"
-                # and click like a person would. Later retries (only reached when
-                # the click did not register) stay quick.
+                # and click like a person would. Later retries stay quick.
                 if attempt == 0:
                     await human.click(page, publish_button)
                 else:
                     await publish_button.click()
+
+            # The "Post now" confirmation is what actually publishes the clip.
+            if await confirm_button.count():
+                if attempt == 0:
+                    await human.click(page, confirm_button)
+                else:
+                    await confirm_button.click()
+
             try:
-                await page.wait_for_url(CONTENT_URL, timeout=3000)
-                return True
+                await page.wait_for_url(CONTENT_URL, timeout=_PUBLISH_POLL_MS)
+                return True, ""
             except Exception:  # noqa: BLE001 - not navigated yet, keep trying
                 pass
-            # Some flows confirm via a modal instead of a navigation.
-            if await page.locator("div.common-modal-confirm-modal").count():
-                return True
+
+            # A refused post shows a modal instead of the redirect.
+            if await _close_blocking_modal(base, page):
+                return False, "TikTok refused the post (see the dialog on the page)"
         except Exception as exc:  # noqa: BLE001 - retry the click
             logger.debug("TikTok: publish retry (%s)", clip_error(exc))
         # Space out the retries with a short, human-like pause rather than a
         # metronomic half-second interval.
         await human.pause(page, 600, 1200)
-    return False
+    return False, "publish did not confirm (no redirect to the content list)"
 
 
 async def _get_last_video_id(base, page) -> Tuple[str, str]:
@@ -357,16 +511,26 @@ async def upload(
     page = await context.new_page()
     page.set_default_timeout(60_000)
     try:
-        # 1) English UI, then the upload form -----------------------------------
-        await _change_language(page)
-        await page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-        # Let the Studio page load, then pause before reacting to it.
-        await human.wait_ready(page)
+        # 1) open the upload form, in English -----------------------------------
+        await _ensure_english_ui(page, UPLOAD_URL)
+
+        # A stale session bounces the upload page to the login form; fail with a
+        # clear message instead of an opaque selector timeout further down.
+        if "/login" in page_url(page).lower():
+            return UploadResult.failure(
+                "TikTok login expired — run: "
+                "python main.py publish manual --profile <name>",
+                auth_required=True,
+            )
 
         # 2) the form may be inline or inside an iframe -------------------------
+        # Clear the onboarding tour before touching the form (it can be raised
+        # again as soon as the file is chosen), then wait for a real signal —
+        # the "Select video" button — instead of a container that does not exist.
+        await _dismiss_onboarding(page)
         try:
             await page.wait_for_selector(
-                f"{_UPLOAD_IFRAME}, div.upload-container", timeout=30_000
+                f'{_UPLOAD_IFRAME}, button:has-text("Select video")', timeout=30_000
             )
         except Exception:  # noqa: BLE001 - proceed and let the next step fail
             pass
@@ -385,8 +549,11 @@ async def upload(
         file_chooser = await fc_info.value
         await file_chooser.set_files(file_path)
 
-        # 4) caption: title + hashtags ------------------------------------------
-        await _add_title_and_tags(base, page, short.title, tags)
+        # 4) caption: title + description + hashtags ----------------------------
+        # Choosing a file can raise the onboarding tour again; clear it before
+        # typing so the overlay does not swallow the clicks on the caption box.
+        await _dismiss_onboarding(page)
+        await _add_title_and_tags(base, page, short.title, short.description, tags)
 
         # 5) wait for the transfer to finish ------------------------------------
         if not await _detect_upload_status(base, page, file_path, log):
@@ -410,10 +577,9 @@ async def upload(
                 )
 
         # 7) publish -------------------------------------------------------------
-        if not await _click_publish(base, page, log):
-            return UploadResult.failure(
-                "publish did not confirm (no redirect to the content list)"
-            )
+        published, publish_error = await _click_publish(base, page, log)
+        if not published:
+            return UploadResult.failure(publish_error or "publish did not confirm")
 
         # 8) read back the published video id -----------------------------------
         video_id, video_url = await _get_last_video_id(base, page)
@@ -427,6 +593,3 @@ async def upload(
             await page.close()
         except Exception:  # noqa: BLE001 - best effort
             pass
-
-
-__all__ = ["NAME", "LABEL", "check", "upload", "UPLOAD_URL", "CONTENT_URL"]
