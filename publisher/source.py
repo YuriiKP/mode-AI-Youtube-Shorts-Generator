@@ -13,6 +13,12 @@ come from the clipping pipeline in one of three shapes, tried in order:
 
 A single ``--video path`` bypasses all of the above and builds one short, pulling
 its title/hashtags from the ``<video>.txt`` sidecar when present.
+
+Because the sidecars are written once (when the clips are rendered), they can go
+stale: an unwanted clip the user deleted afterwards is still listed in them but
+no longer exists on disk. Every sidecar entry is therefore checked against the
+filesystem and entries whose video file is gone are dropped with a warning — see
+:func:`_drop_missing`.
 """
 
 from __future__ import annotations
@@ -84,7 +90,12 @@ def load_shorts(
 
 
 def _load_from_output_dir(out_dir: str, json_path: Optional[str], log) -> List[Short]:
-    """Load shorts from the JSON sidecar, then the text sheet, then a scan."""
+    """Load shorts from the JSON sidecar, then the text sheet, then a scan.
+
+    Each sidecar is filtered through :func:`_drop_missing`, so an entry pointing
+    at a clip that was deleted after the sheet was written is skipped instead of
+    being uploaded (or reported as a failure) later on.
+    """
     json_file = (
         _resolve(json_path, os.getcwd())
         if json_path
@@ -92,7 +103,7 @@ def _load_from_output_dir(out_dir: str, json_path: Optional[str], log) -> List[S
     )
 
     if os.path.isfile(json_file):
-        shorts = _parse_json_report(json_file, out_dir)
+        shorts = _drop_missing(_parse_json_report(json_file, out_dir), log)
         if shorts:
             log.info("loaded %d short(s) from %s", len(shorts), json_file)
             return shorts
@@ -100,7 +111,7 @@ def _load_from_output_dir(out_dir: str, json_path: Optional[str], log) -> List[S
 
     txt_file = os.path.join(out_dir, TXT_SIDECAR)
     if os.path.isfile(txt_file):
-        shorts = _parse_text_report(txt_file, out_dir)
+        shorts = _drop_missing(_parse_text_report(txt_file, out_dir), log)
         if shorts:
             log.info("loaded %d short(s) from %s", len(shorts), txt_file)
             return shorts
@@ -114,6 +125,29 @@ def _load_from_output_dir(out_dir: str, json_path: Optional[str], log) -> List[S
     else:
         log.warning("no shorts found in %s", out_dir)
     return shorts
+
+
+def _drop_missing(shorts: List[Short], log) -> List[Short]:
+    """Drop shorts whose video file is no longer present on disk.
+
+    A sidecar (``shorts_info.json`` / ``shorts_info.txt``) is written once, when
+    the clips are rendered. The user can delete an unwanted clip afterwards,
+    which leaves the sheet listing a file that no longer exists. Such entries
+    are skipped with a warning so the publisher never uploads a missing file and
+    never reports it as a spurious upload failure. The order of the surviving
+    shorts is preserved.
+    """
+    present: List[Short] = []
+    for short in shorts:
+        if short.exists:
+            present.append(short)
+        else:
+            log.warning(
+                "clip #%s (%s) is listed in the shorts sheet but missing on disk; skipping it",
+                short.number or "?",
+                short.name or short.file or "?",
+            )
+    return present
 
 
 def _parse_json_report(json_file: str, out_dir: str) -> List[Short]:
