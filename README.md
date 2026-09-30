@@ -367,19 +367,28 @@ LLM придумывает вместе с хайлайтом, а в JSON они
 [`social-auto-upload`](https://github.com/dreammis/social-auto-upload).
 
 Браузерная автоматизация работает на анти-детект движке
-[ShardX](https://github.com/ProxyShard/ShardBrowser) через его Python SDK:
-спуфинг отпечатка на уровне движка (WebGL/WebGPU/Client Hints/TLS/шрифты), свой
-Chromium и куки в профиле SDK; установка Chrome не нужна.
+[ShardX](https://github.com/ProxyShard/ShardBrowser) через локальный HTTP API
+приложения **ShardX Launcher**: спуфинг отпечатка на уровне движка
+(WebGL/WebGPU/Client Hints/TLS/шрифты), свой Chromium и куки в профиле лаунчера;
+установка Chrome не нужна.
 
 ### Установка браузерного стека
 
+Публикация управляет установленным приложением **ShardX Launcher** через его
+локальный HTTP API (`http://127.0.0.1:40325` по умолчанию). Нужно:
+
+1. установить и запустить **ShardX Launcher**;
+2. в *Settings → Automation API* включить API и скопировать **Bearer-токен**;
+3. прописать токен в `.env` (см. `PUBLISH_SHARDX_API_TOKEN` ниже).
+
 ```bash
-pip install shardx               # движок скачается с CDN при первом запуске
+# python-сторона: HTTP-клиент к API лаунчера + stealth-подключение по CDP
+pip install httpx patchright
 ```
 
-Отдельно ставить Chrome/Chromium не нужно: ShardX запускает собственный браузер
-и спуфит отпечаток внутри движка, а куки и отпечаток хранит сам профиль SDK (id
-профиля запоминается в `meta.json` рядом с профилем).
+Отдельно ставить Chrome/Chromium не нужно: ShardX Launcher запускает собственный
+браузер и спуфит отпечаток внутри движка, а куки и отпечаток хранит сам профиль
+лаунчера (id профиля запоминается в `meta.json` рядом с профилем).
 
 ### Профили и авторизация
 
@@ -398,6 +407,13 @@ python main.py publish profiles
 
 В ручном режиме скрипт открывает окно и просто ждёт: логинитесь, настраиваете что
 нужно, закрываете окно — **все куки профиля сохраняются автоматически**.
+
+Публикатор и лаунчер связаны по имени. Если профиль уже есть в **ShardX Launcher**
+(создан там вручную или остался от старого SDK), он подхватывается автоматически,
+как только вы назовёте его через `--profile <имя>` — отдельная регистрация не
+нужна. `publish profiles` дополнительно показывает имена профилей, которые есть в
+лаунчере, но ещё не «усвоены» публикатором. При этом `--profiles all` перебирает
+только уже усвоенные профили, чтобы клипы не улетели в случайные профили лаунчера.
 
 ### Загрузка
 
@@ -448,21 +464,19 @@ PUBLISH_PROFILE_DIR=browser_profiles   # где живут профили (в п
 PUBLISH_DB=publish_state.sqlite3       # история загрузок / защита от дублей
 PUBLISH_OUTPUT_DIR=output              # откуда брать клипы и shorts_info.json
 PUBLISH_HEADLESS=false                 # для загрузки окно лучше оставлять видимым
-PUBLISH_PROXY=                         # например http://127.0.0.1:7890 (для YouTube/TikTok из РФ)
+PUBLISH_PROXY=                         # например http://127.0.0.1:7890 (для YouTube/TikTok из РФ); привязывается к профилю при создании
 PUBLISH_TAGS=anime,shorts              # хэштеги по умолчанию, если у клипа их нет
 PUBLISH_VISIBILITY=public              # public | unlisted | private (YouTube)
 PUBLISH_YT_PLAYLIST=                   # необязательный плейлист YouTube
 PUBLISH_DELAY=30                       # пауза между загрузками, сек
 
-# Настройки движка shardx (анти-детект движок ShardX, по умолчанию):
-PUBLISH_SHARDX_TEMPLATE=               # id шаблона отпечатка (win-rtx4060, mac-m1-air13, ...); "" -> случайный
-PUBLISH_SHARDX_PLATFORM=Windows        # Windows | macOS | Linux (для случайного шаблона)
-PUBLISH_SHARDX_CACHE_DIR=              # каталог кэша SDK; "" -> по умолчанию
-PUBLISH_SHARDX_SCREEN_MODE=            # profile | cap_to_host | use_host; "" -> авто
-PUBLISH_SHARDX_RANDOMIZE=false         # пере-рандомизировать CPU/RAM/версию платформы
+# ShardX Launcher — локальный HTTP API (приложение должно быть запущено):
+PUBLISH_SHARDX_API_URL=http://127.0.0.1:40325   # адрес API лаунчера
+PUBLISH_SHARDX_API_TOKEN=              # Bearer-токен из Settings -> Automation API (обязателен)
+PUBLISH_SHARDX_PLATFORM=Windows        # Windows | macOS | Linux (отпечаток для нового профиля; "" -> хост)
 PUBLISH_SHARDX_NOISE=                  # canvas,webgl,audio,client_rects,sensors,fonts
 PUBLISH_SHARDX_WEBRTC=auto             # auto | tcp_only | block
-PUBLISH_SHARDX_LANGUAGE=en-US          # язык браузера: en-US | ru-RU | "" ("" -> SDK берёт из гео)
+PUBLISH_SHARDX_LANGUAGE=en-US          # язык браузера: en-US | ru-RU | "" ("" -> лаунчер берёт из гео)
 ```
 
 Каталог `browser_profiles/` содержит куки, поэтому он в `.gitignore`. Любой флаг
@@ -506,7 +520,8 @@ publisher/                  публикация готовых клипов н�
 ├── cli.py                  подкоманды publish (manual / check / upload / profiles)
 ├── config.py               загрузка PUBLISH_* из .env
 ├── publish.py              оркестрация: профили × платформы × клипы, отчёт
-├── session.py              запуск браузера ShardX + постоянный профиль (куки)
+├── session.py              запуск профиля в ShardX Launcher + постоянный профиль (куки)
+├── browser/                бэкенд: локальный HTTP API лаунчера + CDP через patchright
 ├── profile.py              именованные профили, блокировка, meta.json
 ├── platforms/              адаптеры площадок (youtube.py, tiktok.py)
 ├── source.py               чтение shorts_info.json / .txt / папки
@@ -531,6 +546,12 @@ publisher/                  публикация готовых клипов н�
 - **Хочется лучших моментов** — настройте `VIRALITY_CRITERIA` /
   `HIGHLIGHT_SYSTEM_PROMPT` в `shorts_generator/highlights.py` или смените
   `LLM_PROVIDER`.
+- **`could not reach the ShardX launcher …`** — приложение ShardX Launcher не
+  запущено или API выключен. Запустите лаунчер и включите *Settings →
+  Automation API*.
+- **`the ShardX launcher rejected the API token (HTTP 401)`** — задайте
+  `PUBLISH_SHARDX_API_TOKEN` равным токену из *Settings → Automation API*
+  лаунчера.
 
 ## Лицензия
 

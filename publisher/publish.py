@@ -38,6 +38,7 @@ from .profile import (
     get_profile,
     list_profiles,
     resolve_profiles,
+    unregistered_launcher_profiles,
 )
 from .session import (
     BrowserUnavailableError,
@@ -648,15 +649,24 @@ def render_profiles(cfg: PublishConfig) -> str:
     """A human-readable listing of the known browser profiles."""
     profiles = list_profiles(cfg)
     if not profiles:
-        return (
-            "no browser profiles yet.\n"
-            "Create one with: python main.py publish manual --profile profile_1"
-        )
-    lines = [f"profiles under {cfg.profiles_path}:", ""]
-    for profile in profiles:
-        lines.append(f"  - {profile.describe()}")
-        if profile.created_at:
-            lines.append(f"      created: {profile.created_at}")
+        lines = [
+            "no browser profiles yet.",
+            "Create one with: python main.py publish manual --profile profile_1",
+        ]
+    else:
+        lines = [f"profiles under {cfg.profiles_path}:", ""]
+        for profile in profiles:
+            lines.append(f"  - {profile.describe()}")
+            if profile.created_at:
+                lines.append(f"      created: {profile.created_at}")
+
+    available = unregistered_launcher_profiles(cfg)
+    if available:
+        lines.append("")
+        lines.append("also in the ShardX Launcher (name one to register it):")
+        for name in available:
+            lines.append(f"  - {name}")
+
     return "\n".join(lines)
 
 

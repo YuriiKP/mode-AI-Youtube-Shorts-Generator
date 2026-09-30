@@ -1,22 +1,26 @@
 """Browser profile management for the publisher.
 
-A *profile* is a named, persistent Chromium user-data directory. Everything a
-site needs to stay logged in — cookies, local storage, the whole session — lives
-inside that one directory, which is exactly why a single profile can hold the
-logins for several platforms at once (YouTube *and* TikTok). Nothing is copied
-out of it; the directory **is** the credential store.
+A *profile* is a named, **local** record that ties a friendly name
+(``profile_1``) to one identity inside the ShardX Launcher. The real browser
+state — cookies, the frozen fingerprint, the Chromium user-data-dir — now lives
+with the launcher (under its data root); here we keep only the publisher's own
+bookkeeping, so no browser data is ever copied around.
 
-On disk a profile looks like::
+On disk a profile is just our metadata::
 
     browser_profiles/
       profile_1/
-        Default/            # Chromium user-data-dir (cookies live here)
-        meta.json           # our bookkeeping: note, platforms, timestamps
+        meta.json           # ours: name, platforms, timestamps, shardx_id
         storage_state.json  # optional, portable backup of the cookies
-        .publisher.lock     # advisory lock while a browser is open
+        .publisher.lock     # advisory lock while the profile is in use
+
+``meta.json`` carries ``shardx_id`` — the UUID of the matching launcher profile —
+which is the whole point of the folder: it is how a friendly name finds its
+cookies again on the next run. The Chromium user-data-dir itself is **not** here;
+the ShardX Launcher owns it.
 
 This module is deliberately browser-free: it only knows about paths, metadata and
-an advisory lock. Launching the browser against a profile lives in
+an advisory lock. Opening the profile in the launcher lives in
 :mod:`publisher.session`.
 """
 
@@ -28,7 +32,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from .config import PublishConfig
 from .log import log
@@ -47,8 +51,10 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # ``all`` / ``*`` are selectors, never real profile names.
 _RESERVED = {"all", "*"}
 
-# A directory counts as a browser profile when it carries any of these markers.
-# ``meta.json`` is ours; ``Default`` and ``Local State`` are created by Chromium.
+# A directory counts as a profile when it carries ``meta.json`` (ours). The
+# legacy ``Default`` / ``Local State`` markers are still accepted so directories
+# written by the old Chromium-backed layout keep being listed; new profiles only
+# ever get ``meta.json`` — the Chromium user-data-dir now lives in the launcher.
 _PROFILE_MARKERS = (META_FILE, "Default", "Local State")
 
 
@@ -129,8 +135,8 @@ class Profile:
     updated_at: str = ""
     # Platforms whose login has been recorded in this profile.
     platforms: List[str] = field(default_factory=list)
-    # Id of the matching ShardX SDK profile (its fingerprint and cookies live
-    # there); empty until the profile is first opened.
+    # Id (UUID) of the matching ShardX Launcher profile, where the fingerprint
+    # and cookies live; empty until the profile is first opened.
     shardx_id: str = ""
 
     # -- paths -------------------------------------------------------------
@@ -269,8 +275,47 @@ def _looks_like_profile(path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _launcher_profile_items(cfg: PublishConfig) -> List[Dict[str, Any]]:
+    """Best-effort list of the profiles the ShardX Launcher knows about."""
+    try:
+        from .browser.api import launcher_profiles
+    except Exception:  # noqa: BLE001 - an import error must not break listing
+        return []
+    try:
+        return launcher_profiles(cfg)
+    except Exception as exc:  # noqa: BLE001 - discovery must never break listing
+        log.debug("could not read the ShardX Launcher profile list: %s", exc)
+        return []
+
+
+def _adopt(cfg: PublishConfig, name: str, api_id: str) -> Profile:
+    """Register a launcher profile locally so ``name`` maps to its id."""
+    path = os.path.join(profiles_root(cfg), name)
+    profile = Profile(name=name, path=path, created_at=_now())
+    profile.shardx_id = api_id
+    profile.save_meta()
+    log.info("adopted ShardX Launcher profile %s as '%s'", api_id, name)
+    return profile
+
+
+def _adopt_launcher_by_name(cfg: PublishConfig, name: str) -> Optional[Profile]:
+    """Adopt the launcher profile called ``name``, or ``None`` when there is none."""
+    for item in _launcher_profile_items(cfg):
+        if str(item.get("name") or "").strip() != name:
+            continue
+        api_id = str(item.get("id") or "").strip()
+        if api_id:
+            return _adopt(cfg, name, api_id)
+    return None
+
+
 def list_profiles(cfg: PublishConfig) -> List[Profile]:
-    """Return every profile found under the profiles root (sorted by name)."""
+    """Return every profile registered locally (sorted by name).
+
+    This is the publisher's own registry, not the launcher's profile list — a
+    launcher profile shows up here only after it has been named once (see
+    :func:`get_profile`, which adopts it) or created with ``publish manual``.
+    """
     root = profiles_root(cfg, create=False)
     if not os.path.isdir(root):
         return []
@@ -282,6 +327,26 @@ def list_profiles(cfg: PublishConfig) -> List[Profile]:
             continue
         profiles.append(Profile.load(path))
     return profiles
+
+
+def unregistered_launcher_profiles(cfg: PublishConfig) -> List[str]:
+    """Names of launcher profiles that are not registered with the publisher yet.
+
+    Sorted, and limited to names usable as a local profile directory. Handy for a
+    "did you mean" hint: such a profile starts working the moment it is named on
+    the command line (e.g. ``--profile p1``), which adopts it.
+    """
+    skip = {profile.name for profile in list_profiles(cfg)}
+    names: List[str] = []
+    for item in _launcher_profile_items(cfg):
+        name = str(item.get("name") or "").strip()
+        if not name or name in skip or name in names:
+            continue
+        try:
+            names.append(validate_name(name))
+        except ProfileError:
+            continue
+    return sorted(names)
 
 
 def create_profile(cfg: PublishConfig, name: str, note: str = "") -> Profile:
@@ -302,17 +367,28 @@ def get_profile(
     create: bool = False,
     note: str = "",
 ) -> Profile:
-    """Fetch one profile by name, optionally creating it when missing."""
+    """Fetch one profile by name, optionally creating it when missing.
+
+    A name that is not registered locally is matched against the ShardX Launcher
+    first and adopted when it matches, so a profile created in the launcher works
+    right away (``--profile p1``) instead of being reported as missing.
+    """
     name = validate_name(name)
     path = os.path.join(profiles_root(cfg), name)
-    if not os.path.isdir(path):
-        if not create:
-            raise ProfileError(
-                f"Profile '{name}' does not exist under {profiles_root(cfg)}. "
-                f"Create it with: python main.py publish manual --profile {name}"
-            )
-        return create_profile(cfg, name, note=note)
-    return Profile.load(path)
+    if os.path.isdir(path):
+        return Profile.load(path)
+
+    adopted = _adopt_launcher_by_name(cfg, name)
+    if adopted is not None:
+        return adopted
+
+    if not create:
+        raise ProfileError(
+            f"Profile '{name}' does not exist under {profiles_root(cfg)} and the "
+            f"ShardX Launcher has no profile named '{name}'. Create it with: "
+            f"python main.py publish manual --profile {name}"
+        )
+    return create_profile(cfg, name, note=note)
 
 
 def resolve_profiles(
@@ -465,5 +541,6 @@ __all__ = [
     "profile_path",
     "profiles_root",
     "resolve_profiles",
+    "unregistered_launcher_profiles",
     "validate_name",
 ]

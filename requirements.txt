@@ -16,12 +16,9 @@ numpy>=1.25
 # scene_transitions.py falls back to OpenCV when this is not installed).
 scenedetect>=0.6,<0.9
 
-# Publishing (python main.py publish ...): browser automation runs on the ShardX
-# anti-detect engine via its Python SDK. It downloads a patched Chromium engine
-# from the CDN on first use; no separate `patchright install` or Google Chrome is
-# required.
-shardx
-
-# The ShardX SDK drives its browser through patchright over CDP, so patchright is
-# required at runtime.
+# Publishing (python main.py publish ...): browser automation drives the ShardX
+# Launcher's local automation HTTP API (the launcher app must be installed and
+# running). The launcher ships its own patched Chromium engine, so no separate
+# `patchright install` or Google Chrome is required.
+httpx>=0.27
 patchright>=1.49

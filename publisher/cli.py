@@ -91,7 +91,7 @@ def add_publish_actions(publish: argparse.ArgumentParser) -> None:
     """
     publish.description = (
         "Publish rendered shorts to YouTube and/or TikTok using browser "
-        "automation (the ShardX anti-detect engine) and persistent "
+        "automation (the ShardX Launcher's anti-detect engine) and persistent "
         "browser profiles."
     )
     publish.formatter_class = argparse.RawDescriptionHelpFormatter

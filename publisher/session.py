@@ -2,18 +2,19 @@
 publisher starts a browser.
 
 :func:`open_profile_context` delegates the whole launch *and* teardown to the
-ShardX engine (:mod:`publisher.browser.shardx_backend`). Everything downstream —
+ShardX Launcher (:mod:`publisher.browser.shardx_backend`). Everything downstream —
 the platform uploaders in :mod:`publisher.platforms` — only ever sees the
 ``BrowserContext`` the backend yields, so it stays completely engine-agnostic.
 
 The profile is opened as a **persistent context**: the cookies live in the
-profile's user-data dir (owned by the SDK), so nothing has to be exported or
-re-imported between runs, and the interactive ``manual`` mode saves the user's
-logins automatically.
+profile's user-data dir (owned by the ShardX Launcher), so nothing has to be
+exported or re-imported between runs, and the interactive ``manual`` mode saves
+the user's logins automatically.
 
-The engine is imported lazily (inside the backend module), so importing this
-module — or simply running the clipping pipeline — never fails on a machine
-where the ShardX SDK has not been installed yet.
+The backend (``httpx`` + ``patchright``) is imported lazily inside
+:mod:`publisher.browser.shardx_backend`, so importing this module — or simply
+running the clipping pipeline — never fails on a machine where the browser stack
+has not been installed yet.
 
 This module also holds the small, engine-independent helpers the commands use:
 the per-platform entry URLs, opening a set of tabs, and exporting a portable
@@ -57,7 +58,7 @@ async def open_profile_context(
     *,
     headless: Optional[bool] = None,
 ) -> AsyncIterator["object"]:
-    """Open ``profile`` in the ShardX browser and yield its persistent context.
+    """Open ``profile`` in the ShardX Launcher and yield its persistent context.
 
     An advisory :class:`~publisher.profile.ProfileLock` is taken for the
     duration, so two commands can never fight over the same profile. The browser

@@ -39,17 +39,15 @@ How clips are spread over profiles::
   publication; the number of ``PUBLISH_SCHEDULE`` entries is how many clips each
   profile publishes (entry *r* is the time of that profile's *r*-th clip).
 
-Browser automation runs on the ShardX anti-detect engine (through its Python SDK),
-which adds these keys::
+Browser automation drives the ShardX Launcher's local automation HTTP API (the
+launcher must be running), which adds these keys::
 
-    PUBLISH_SHARDX_TEMPLATE=            # library template id (e.g. win-rtx4060); "" -> random
-    PUBLISH_SHARDX_PLATFORM=Windows     # Windows | macOS | Linux (used when the template is empty)
-    PUBLISH_SHARDX_CACHE_DIR=           # SDK cache root; "" -> the SDK default
-    PUBLISH_SHARDX_SCREEN_MODE=         # profile | cap_to_host | use_host; "" -> auto
-    PUBLISH_SHARDX_RANDOMIZE=false      # re-randomize CPU/RAM/platform_version before launch
-    PUBLISH_SHARDX_NOISE=               # canvas,webgl,audio,client_rects,sensors,fonts
-    PUBLISH_SHARDX_WEBRTC=auto          # auto | tcp_only | block
-    PUBLISH_SHARDX_LANGUAGE=en-US       # en-US | ru-RU | "" (auto: the SDK derives it from geo)
+    PUBLISH_SHARDX_API_URL=http://127.0.0.1:40325  # launcher automation API base URL
+    PUBLISH_SHARDX_API_TOKEN=            # Bearer JWT from Settings > Automation API
+    PUBLISH_SHARDX_PLATFORM=Windows      # Windows | macOS | Linux (fingerprint to freeze; "" -> host)
+    PUBLISH_SHARDX_NOISE=                # canvas,webgl,audio,client_rects,sensors,fonts
+    PUBLISH_SHARDX_WEBRTC=auto           # auto | tcp_only | block
+    PUBLISH_SHARDX_LANGUAGE=en-US        # en-US | ru-RU | "" (auto: the launcher derives it from geo)
 """
 
 from __future__ import annotations
@@ -71,10 +69,10 @@ VALID_VISIBILITIES = ("public", "unlisted", "private")
 VALID_PUBLISH_MODES = ("distribute", "schedule")
 
 # ShardX-specific choices (see ``publisher.browser.shardx_backend``). The
-# platform names are case-sensitive on purpose — they are passed straight to the
-# SDK, which expects ``Windows`` / ``macOS`` / ``Linux``.
+# platform names are case-sensitive on purpose — they are the library tags the
+# launcher's ``/fingerprint/new/{platform}`` endpoint expects (``Windows`` /
+# ``macOS`` / ``Linux``).
 VALID_SHARDX_PLATFORMS = ("Windows", "macOS", "Linux")
-VALID_SHARDX_SCREEN_MODES = ("profile", "cap_to_host", "use_host")
 VALID_SHARDX_WEBRTC = ("auto", "tcp_only", "block")
 VALID_SHARDX_NOISE = ("canvas", "webgl", "audio", "client_rects", "sensors", "fonts")
 
@@ -95,18 +93,16 @@ _FIELD_ENV = {
     "delay": "PUBLISH_DELAY",
     "mode": "PUBLISH_MODE",
     "schedule": "PUBLISH_SCHEDULE",
-    # ShardX backend.
-    "shardx_template": "PUBLISH_SHARDX_TEMPLATE",
+    # ShardX backend (launcher automation API).
+    "shardx_api_url": "PUBLISH_SHARDX_API_URL",
+    "shardx_api_token": "PUBLISH_SHARDX_API_TOKEN",
     "shardx_platform": "PUBLISH_SHARDX_PLATFORM",
-    "shardx_cache_dir": "PUBLISH_SHARDX_CACHE_DIR",
-    "shardx_screen_mode": "PUBLISH_SHARDX_SCREEN_MODE",
-    "shardx_randomize": "PUBLISH_SHARDX_RANDOMIZE",
     "shardx_noise": "PUBLISH_SHARDX_NOISE",
     "shardx_webrtc": "PUBLISH_SHARDX_WEBRTC",
     "shardx_language": "PUBLISH_SHARDX_LANGUAGE",
 }
 
-_BOOL_FIELDS = {"headless", "shardx_randomize"}
+_BOOL_FIELDS = {"headless"}
 _FLOAT_FIELDS = {"delay"}
 _LIST_FIELDS = {"tags", "shardx_noise"}
 _STR_FIELDS = {
@@ -114,8 +110,8 @@ _STR_FIELDS = {
     "db_path",
     "output_dir",
     "proxy",
-    "shardx_template",
-    "shardx_cache_dir",
+    "shardx_api_url",
+    "shardx_api_token",
     "shardx_language",
 }
 
@@ -126,12 +122,7 @@ _CHOICE_FIELDS = {
     "mode": ("distribute", VALID_PUBLISH_MODES),
 }
 
-# field name -> allowed values, where an empty string means "auto / unset".
-_OPTIONAL_CHOICE_FIELDS = {
-    "shardx_screen_mode": VALID_SHARDX_SCREEN_MODES,
-}
-
-# Accepted spellings for PUBLISH_SHARDX_PLATFORM -> the canonical SDK value.
+# Accepted spellings for PUBLISH_SHARDX_PLATFORM -> the canonical value.
 _SHARDX_PLATFORM_ALIASES = {
     "windows": "Windows",
     "win": "Windows",
@@ -181,17 +172,6 @@ def _as_choice(value: Any, key: str, default: str, choices: Sequence[str]) -> st
     if text not in choices:
         allowed = ", ".join(choices)
         raise ConfigError(f"{key} must be one of: {allowed}; got: {value!r}")
-    return text
-
-
-def _as_optional_choice(value: Any, key: str, choices: Sequence[str]) -> str:
-    """Like :func:`_as_choice`, but an empty value means "leave it to the SDK"."""
-    text = _as_str(value, "").lower()
-    if text == "":
-        return ""
-    if text not in choices:
-        allowed = ", ".join(choices)
-        raise ConfigError(f"{key} must be empty or one of: {allowed}; got: {value!r}")
     return text
 
 
@@ -295,29 +275,27 @@ class PublishConfig:
     # Uploads must keep the window open until the transfer really finishes, so
     # headed (headless=False) is the safe default.
     headless: bool = False
-    # Optional proxy applied to every launch, e.g. "http://127.0.0.1:7890".
-    # For the shardx backend it is bound to the profile instead.
+    # Optional proxy, e.g. "http://127.0.0.1:7890". It is bound to a profile
+    # when the profile is first created on the launcher (which full-tests it:
+    # UDP + geo). To switch proxies later, delete the launcher profile (or clear
+    # ``shardx_id`` in the profile's meta.json) so it is recreated.
     proxy: str = ""
 
-    # ShardX backend -------------------------------------------------------------
-    # Library template id (e.g. "win-rtx4060"); empty -> a random template for
-    # ``shardx_platform`` is frozen under a new id on first use.
-    shardx_template: str = ""
-    # Platform for the random template: Windows | macOS | Linux; empty -> host.
+    # ShardX backend (Launcher automation API) -----------------------------------
+    # Base URL of the launcher's local automation API.
+    shardx_api_url: str = "http://127.0.0.1:40325"
+    # Bearer JWT from the launcher's Settings > Automation API (required).
+    shardx_api_token: str = ""
+    # Platform whose library fingerprint the new profile is frozen from:
+    # Windows | macOS | Linux; empty -> the launcher's host platform.
     shardx_platform: str = ""
-    # SDK cache root (engine + saved profiles); empty -> the SDK's own default.
-    shardx_cache_dir: str = ""
-    # Screen strategy: profile | cap_to_host | use_host; empty -> SDK auto.
-    shardx_screen_mode: str = ""
-    # Re-randomize CPU/RAM/platform_version before each launch.
-    shardx_randomize: bool = False
     # Anti-fingerprint noise vectors (canvas, webgl, audio, ...).
     shardx_noise: List[str] = field(default_factory=list)
     # WebRTC policy: auto | tcp_only | block.
     shardx_webrtc: str = "auto"
     # Browser language (BCP-47) forced on the profile: "en-US", "ru-RU", or "" /
-    # "auto" to let the SDK derive it from geo. Only the language is pinned;
-    # timezone/geolocation still come from the geo lookup.
+    # "auto" to let the launcher derive it from geo. Only the language is pinned;
+    # timezone/geolocation still come from the launcher's geo lookup.
     shardx_language: str = "en-US"
 
     # Distribution / scheduling ------------------------------------------------
@@ -407,8 +385,6 @@ def _coerce(field_name: str, raw: Any) -> Any:
     if field_name in _CHOICE_FIELDS:
         default, choices = _CHOICE_FIELDS[field_name]
         return _as_choice(raw, env_key, default, choices)
-    if field_name in _OPTIONAL_CHOICE_FIELDS:
-        return _as_optional_choice(raw, env_key, _OPTIONAL_CHOICE_FIELDS[field_name])
     if field_name == "shardx_platform":
         return _as_platform(raw, env_key)
     return _as_str(raw, "")
@@ -492,7 +468,6 @@ __all__ = [
     "VALID_PUBLISH_MODES",
     "VALID_SHARDX_NOISE",
     "VALID_SHARDX_PLATFORMS",
-    "VALID_SHARDX_SCREEN_MODES",
     "VALID_SHARDX_WEBRTC",
     "VALID_VISIBILITIES",
     "load_publish_config",

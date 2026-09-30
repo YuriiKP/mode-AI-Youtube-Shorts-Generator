@@ -1,9 +1,9 @@
 """Shared primitives for the publisher's browser backend.
 
-Everything that touches a browser is launched by the ShardX anti-detect engine
-(see :mod:`publisher.browser.shardx_backend`). This module only holds the small
-engine-independent pieces the rest of the package imports: the error raised when
-a launch cannot happen, and the shared page-operation timeout.
+Everything that touches a browser is launched through the ShardX Launcher's
+automation API (see :mod:`publisher.browser.shardx_backend`). This module only
+holds the small engine-independent pieces the rest of the package imports: the
+error raised when a launch cannot happen, and the shared page-operation timeout.
 """
 
 from __future__ import annotations

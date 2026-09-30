@@ -14,9 +14,10 @@ Design highlights
 * Everything is driven from the command line, wired into the project's single
   entry point (``python main.py publish ...``).
 
-The heavy/optional engine dependency (:mod:`shardx`) is imported lazily inside
-the module that actually launches a browser, so importing :mod:`publisher` never
-fails on a machine where the SDK is not installed yet.
+The heavy/optional browser dependencies (``httpx`` + ``patchright``, used to
+drive the ShardX Launcher's automation API) are imported lazily inside the module
+that actually launches a browser, so importing :mod:`publisher` never fails on a
+machine where the browser stack is not installed yet.
 """
 
 from __future__ import annotations
