@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Tuple
 
+from .. import human
 from ..log import log as _default_log
 from ..model import Short
 from .base import UploadResult, clip_error, page_url
@@ -70,6 +71,7 @@ async def _change_language(page) -> None:
     try:
         await page.goto(HOME_URL, wait_until="domcontentloaded")
         await page.wait_for_selector('[data-e2e="nav-more-menu"]', timeout=15000)
+        await human.pause(page, 600, 1300)
     except Exception:  # noqa: BLE001 - the UI is left as-is when this fails
         return
 
@@ -82,11 +84,14 @@ async def _change_language(page) -> None:
         pass
 
     try:
-        await menu.click()
-        await page.locator('[data-e2e="language-select"]').click()
-        await page.locator(
-            "#creator-tools-selection-menu-header", has_text="English (US)"
-        ).click()
+        await human.click(page, menu)
+        await human.click(page, page.locator('[data-e2e="language-select"]'))
+        await human.click(
+            page,
+            page.locator(
+                "#creator-tools-selection-menu-header", has_text="English (US)"
+            ),
+        )
     except Exception:  # noqa: BLE001 - non-fatal; we simply continue
         pass
 
@@ -101,29 +106,29 @@ async def _choose_base_locator(page):
 async def _add_title_and_tags(base, page, title: str, tags) -> None:
     """Type the title and hashtags into TikTok's rich-text caption editor."""
     editor = base.locator("div.public-DraftEditor-content")
-    await editor.click()
+    await human.click(page, editor)
 
     # Clear whatever placeholder/prefill is already there.
     await page.keyboard.press("End")
     await page.keyboard.press("Control+A")
     await page.keyboard.press("Delete")
     await page.keyboard.press("End")
-    await page.wait_for_timeout(1000)
+    await human.pause(page, 700, 1400)
 
     if title.strip():
         await page.keyboard.insert_text(title.strip())
-        await page.wait_for_timeout(1000)
+        await human.pause(page, 800, 1500)
         await page.keyboard.press("End")
         await page.keyboard.press("Enter")
 
     for tag in tags:
         await page.keyboard.press("End")
-        await page.wait_for_timeout(1000)
+        await human.pause(page, 700, 1400)
         # Type as "#tag " then remove the trailing space so TikTok registers the
         # hashtag chip without leaving a dangling space behind.
         await page.keyboard.insert_text("#" + tag + " ")
         await page.keyboard.press("Space")
-        await page.wait_for_timeout(1000)
+        await human.pause(page, 700, 1400)
         await page.keyboard.press("Backspace")
         await page.keyboard.press("End")
 
@@ -150,7 +155,7 @@ async def _detect_upload_status(base, page, file_path: str, logger) -> bool:
                 if await error_button.count() and await error_button.first.is_visible():
                     logger.warning("TikTok: upload stalled, re-selecting the file")
                     async with page.expect_file_chooser() as fc_info:
-                        await error_button.first.click()
+                        await human.click(page, error_button.first)
                     chooser = await fc_info.value
                     await chooser.set_files(file_path)
                     retried = True
@@ -164,18 +169,22 @@ async def _detect_upload_status(base, page, file_path: str, logger) -> bool:
 
 async def _upload_thumbnail(base, page, thumbnail: str) -> None:
     """Set a custom cover image (optional; failures are not fatal)."""
-    await base.locator(".cover-container").click()
-    await base.locator(".cover-edit-container", has_text="Upload cover").click()
+    # Every click glides the cursor onto the target instead of teleporting.
+    await human.click(page, base.locator(".cover-container"))
+    await human.click(
+        page, base.locator(".cover-edit-container", has_text="Upload cover")
+    )
     async with page.expect_file_chooser() as fc_info:
-        await base.locator(".upload-image-upload-area").click()
+        await human.click(page, base.locator(".upload-image-upload-area"))
         chooser = await fc_info.value
         await chooser.set_files(thumbnail)
-    await (
-        base.locator("div.cover-edit-panel:not(.hide-panel)")
-        .get_by_role("button", name="Confirm")
-        .click()
+    await human.click(
+        page,
+        base.locator("div.cover-edit-panel:not(.hide-panel)").get_by_role(
+            "button", name="Confirm"
+        ),
     )
-    await page.wait_for_timeout(3000)
+    await human.pause(page, 2000, 3500)
 
 
 async def _set_schedule_time(base, page, schedule_at) -> bool:
@@ -234,10 +243,16 @@ async def _set_schedule_time(base, page, schedule_at) -> bool:
 async def _click_publish(base, page, logger) -> bool:
     """Click "Post" and wait for the confirmation (redirect to the content list)."""
     publish_button = base.locator("div.button-group button").nth(0)
-    for _ in range(60):
+    for attempt in range(60):
         try:
             if await publish_button.count():
-                await publish_button.click()
+                # The first press is the real one: glide the cursor onto "Post"
+                # and click like a person would. Later retries (only reached when
+                # the click did not register) stay quick.
+                if attempt == 0:
+                    await human.click(page, publish_button)
+                else:
+                    await publish_button.click()
             try:
                 await page.wait_for_url(CONTENT_URL, timeout=3000)
                 return True
@@ -248,7 +263,9 @@ async def _click_publish(base, page, logger) -> bool:
                 return True
         except Exception as exc:  # noqa: BLE001 - retry the click
             logger.debug("TikTok: publish retry (%s)", clip_error(exc))
-        await asyncio.sleep(0.5)
+        # Space out the retries with a short, human-like pause rather than a
+        # metronomic half-second interval.
+        await human.pause(page, 600, 1200)
     return False
 
 
@@ -343,6 +360,8 @@ async def upload(
         # 1) English UI, then the upload form -----------------------------------
         await _change_language(page)
         await page.goto(UPLOAD_URL, wait_until="domcontentloaded")
+        # Let the Studio page load, then pause before reacting to it.
+        await human.wait_ready(page)
 
         # 2) the form may be inline or inside an iframe -------------------------
         try:
@@ -357,8 +376,12 @@ async def upload(
         # 3) select the video file ----------------------------------------------
         upload_button = base.locator('button:has-text("Select video"):visible')
         await upload_button.wait_for(state="visible", timeout=60_000)
+        await human.pause(page, 700, 1500)  # a beat before picking the file
         async with page.expect_file_chooser() as fc_info:
-            await upload_button.click()
+            # Glide the cursor onto "Select video" (multi-step mouse move +
+            # jittered click) before the file dialog opens, instead of an
+            # instant teleport-and-click.
+            await human.click(page, upload_button)
         file_chooser = await fc_info.value
         await file_chooser.set_files(file_path)
 

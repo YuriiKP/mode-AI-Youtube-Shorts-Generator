@@ -21,11 +21,11 @@ This module exposes the two coroutines required by
 
 from __future__ import annotations
 
-import asyncio
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
+from .. import human
 from ..log import log as _default_log
 from ..model import Short
 from .base import UploadResult, clip_error, page_url, trim
@@ -98,23 +98,28 @@ async def _fill_editable(page, selector: str, text: str) -> None:
     """
     box = page.locator(selector).first
     await box.wait_for(state="visible", timeout=30000)
-    await box.click()
+    # Glide the cursor onto the field (multi-step mouse move + jittered click)
+    # rather than teleporting to its centre and clicking instantly.
+    await human.click(page, box, timeout=30000)
     await page.keyboard.press("Control+A")
     await page.keyboard.press("Delete")
     try:
         await box.fill(text)
     except Exception:  # noqa: BLE001 - some contenteditable nodes reject fill()
-        await box.type(text, delay=6)
-    await page.wait_for_timeout(400)
+        await human.type_text(box, text)
+    await human.pause(page, 500, 1000)
     await _dismiss_autocomplete(page)
 
 
 async def _click_if_present(page, selector: str, timeout: int = 4000) -> bool:
-    """Click the first element matching ``selector`` if it shows up in time."""
+    """Click the first element matching ``selector`` if it shows up in time.
+
+    The click goes through :func:`human.click`, so the element is waited for,
+    hovered and only then clicked — instead of being hit the instant it exists.
+    """
     try:
         element = page.locator(selector).first
-        await element.wait_for(state="visible", timeout=timeout)
-        await element.click()
+        await human.click(page, element, timeout=timeout)
         return True
     except Exception:  # noqa: BLE001 - absence is a valid outcome
         return False
@@ -213,13 +218,13 @@ async def _upload_playlist(page, playlist: str) -> None:
             "ytcp-video-metadata-playlists ytcp-dropdown-trigger",
             8000,
         )
-        await page.wait_for_timeout(1200)
+        await human.pause(page, 900, 1600)
         existing = page.locator(
             f"tp-yt-paper-checkbox:has-text('{playlist}'), "
             f"ytcp-checkbox-group:has-text('{playlist}')"
         ).first
         if await existing.count():
-            await existing.click()
+            await human.click(page, existing)
         else:
             if await _click_if_present(
                 page,
@@ -227,7 +232,7 @@ async def _upload_playlist(page, playlist: str) -> None:
                 "ytcp-button:has-text('创建播放列表')",
                 4000,
             ):
-                await page.wait_for_timeout(800)
+                await human.pause(page, 600, 1200)
                 await _click_if_present(
                     page,
                     "tp-yt-paper-item:has-text('New playlist'), "
@@ -238,7 +243,7 @@ async def _upload_playlist(page, playlist: str) -> None:
                     "ytcp-playlist-metadata-editor #textbox, #create-playlist-form #textbox"
                 ).first
                 if await title_box.count():
-                    await title_box.click()
+                    await human.click(page, title_box)
                     await title_box.type(playlist, delay=6)
                     await _click_if_present(
                         page,
@@ -256,7 +261,7 @@ async def _upload_playlist(page, playlist: str) -> None:
             3000,
         )
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(600)
+        await human.pause(page, 500, 900)
 
 
 async def _upload_thumbnail(page, thumbnail: str) -> None:
@@ -267,7 +272,7 @@ async def _upload_thumbnail(page, thumbnail: str) -> None:
         ).first
         await thumb_input.wait_for(state="attached", timeout=20000)
         await thumb_input.set_input_files(thumbnail)
-        await page.wait_for_timeout(2000)
+        await human.pause(page, 1500, 2600)
     except Exception:  # noqa: BLE001 - a cover is optional
         pass
 
@@ -301,7 +306,7 @@ async def _set_schedule(page, schedule_at) -> bool:
     option = page.locator(_SCHEDULE_OPTION).first
     try:
         await option.wait_for(state="visible", timeout=8000)
-        await option.click()
+        await human.click(page, option, timeout=8000)
     except Exception:  # noqa: BLE001 - reported to the caller
         return False
 
@@ -311,7 +316,7 @@ async def _set_schedule(page, schedule_at) -> bool:
         )
     except Exception:  # noqa: BLE001 - reported to the caller
         return False
-    await page.wait_for_timeout(600)
+    await human.pause(page, 500, 900)
 
     if not await _set_schedule_date(page, schedule_at):
         return False
@@ -320,13 +325,13 @@ async def _set_schedule(page, schedule_at) -> bool:
         time_input = page.locator(
             "ytcp-datetime-picker #time-of-day-container input"
         ).first
-        await time_input.click()
+        await human.click(page, time_input)
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Delete")
         # Studio's date/time picker expects an English-style "10:00 AM".
         await time_input.type(schedule_at.strftime("%I:%M %p"), delay=40)
         await page.keyboard.press("Enter")
-        await page.wait_for_timeout(500)
+        await human.pause(page, 400, 800)
     except Exception:  # noqa: BLE001 - reported to the caller
         return False
     return True
@@ -335,8 +340,8 @@ async def _set_schedule(page, schedule_at) -> bool:
 async def _set_schedule_date(page, schedule_at) -> bool:
     """Pick the day in the schedule date dropdown (with a JS model fallback)."""
     try:
-        await page.locator("#datepicker-trigger").first.click()
-        await page.wait_for_timeout(600)
+        await human.click(page, page.locator("#datepicker-trigger").first)
+        await human.pause(page, 500, 900)
         day = schedule_at.day
         for selector in (
             f"ytcp-date-picker .day:not([disabled]):text-is('{day}')",
@@ -345,8 +350,8 @@ async def _set_schedule_date(page, schedule_at) -> bool:
         ):
             cell = page.locator(selector).first
             if await cell.count():
-                await cell.click()
-                await page.wait_for_timeout(400)
+                await human.click(page, cell)
+                await human.pause(page, 300, 700)
                 return True
     except Exception:  # noqa: BLE001 - fall through to the JS fallback
         pass
@@ -368,7 +373,7 @@ async def _set_schedule_date(page, schedule_at) -> bool:
             }""",
             [schedule_at.year, schedule_at.month, schedule_at.day],
         )
-        await page.wait_for_timeout(400)
+        await human.pause(page, 300, 700)
         return bool(ok)
     except Exception:  # noqa: BLE001 - reported to the caller
         return False
@@ -391,7 +396,9 @@ async def upload(
     page.set_default_timeout(60_000)
     try:
         await page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        # Let the Studio page finish loading, then take a short human pause
+        # before reacting to it, instead of a fixed three-second sleep.
+        await human.wait_ready(page)
         current = page_url(page)
         if "accounts.google.com" in current or "signin" in current.lower():
             return UploadResult.failure(
@@ -402,6 +409,7 @@ async def upload(
         # 1) choose the video file -------------------------------------------------
         file_input = page.locator('input[type="file"]').first
         await file_input.wait_for(state="attached", timeout=60000)
+        await human.pause(page, 700, 1500)  # a beat before picking the file
         await file_input.set_input_files(file_path)
 
         # 2) wait for the details dialog ------------------------------------------
@@ -443,12 +451,12 @@ async def upload(
         if tags:
             try:
                 await _click_if_present(page, "#toggle-button", 6000)
-                await page.wait_for_timeout(800)
+                await human.pause(page, 600, 1200)
                 tag_input = page.locator(
                     "#tags-container #text-input, "
                     "ytcp-form-input-container#tags-container input"
                 ).first
-                await tag_input.click()
+                await human.click(page, tag_input)
                 await tag_input.type(",".join(tags)[:TAGS_LIMIT] + ",", delay=4)
             except Exception:  # noqa: BLE001 - tags are optional
                 pass
@@ -459,8 +467,8 @@ async def upload(
             if await vis.count() and await vis.first.is_visible():
                 break
             if not await _click_if_present(page, "#next-button", 6000):
-                await page.wait_for_timeout(1200)
-            await page.wait_for_timeout(1000)
+                await human.pause(page, 900, 1600)
+            await human.pause(page, 800, 1400)
 
         # 10) visibility / schedule -----------------------------------------------
         if schedule_at is not None:
@@ -478,14 +486,15 @@ async def upload(
         await _wait_upload_complete(page)
 
         # 11) publish -------------------------------------------------------------
-        await page.wait_for_timeout(1200)
+        await human.pause(page, 900, 1800)
         if not await _click_if_present(page, "#done-button", 15000):
             return UploadResult.failure(
                 "publish button (#done-button) not found — the upload may not "
                 "have reached a publishable state"
             )
 
-        await page.wait_for_timeout(4000)
+        await human.settle(page, timeout=6000)
+        await human.pause(page, 2500, 4000)
         video_url = ""
         video_id = ""
         try:

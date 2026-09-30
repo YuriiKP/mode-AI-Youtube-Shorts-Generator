@@ -27,6 +27,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence
 
+from . import human
 from .config import PublishConfig
 from .distribution import Job, build_jobs, jobs_by_profile, jobs_for_platform
 from .log import log
@@ -621,7 +622,9 @@ async def run_upload(
                                 )
 
                             if target_delay:
-                                await asyncio.sleep(target_delay)
+                                # Space uploads apart with a little random
+                                # jitter so the gaps are not perfectly even.
+                                await human.delay(target_delay)
 
                     if export_cookies:
                         await export_storage_state(context, profile)
