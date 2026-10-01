@@ -10,8 +10,8 @@ This module renders **one random frame** through exactly the same stages a real
 render uses, so what you see is what the final clip will look like, but it
 finishes in a second or two. That makes it practical to iterate on ``.env``
 values (``FIT_*``, ``BACKGROUND_*``, ``SATURATION`` / ``SHARPNESS`` /
-``CHROMATIC_ABERRATION``, ``BANNER_*``, the whole subtitle appearance...) and
-see the result immediately.
+``CHROMATIC_ABERRATION``, the ``UNIQUE_*`` anti-duplicate edits, ``BANNER_*``,
+the whole subtitle appearance...) and see the result immediately.
 
 No transcription happens here. When subtitles are enabled the fixed placeholder
 text :data:`TEST_FRAME_TEXT` is drawn with the very same renderer that burns in

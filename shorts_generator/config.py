@@ -387,6 +387,52 @@ class Settings:
     # faster) and values below ``1`` slow it down (``0.5`` is half speed).
     speed: float = 1.0
 
+    # Уникализация (обход детекции дубликатов) ----------------------------
+    # Набор лёгких, почти незаметных изменений, которые сдвигают перцептивный
+    # хеш кадра и аудио-отпечаток, чтобы площадка не считала ролик копией уже
+    # загруженного видео. Все они применяются тем же быстрым проходом FFmpeg,
+    # что и цветокор (до вшивания субтитров), поэтому текст остаётся чётким.
+    #
+    # Зеркалирование кадра по горизонтали (hflip) — самый сильный сдвиг
+    # перцептивного хеша, но переворачивает и текст/логотипы, которые есть в
+    # самом видео, поэтому по умолчанию выключено.
+    unique_mirror: bool = False
+    # Микро-обрезка: сколько пикселей убрать с каждого края кадра, после чего
+    # картинка растягивается обратно до исходного размера (лёгкий «наезд»).
+    # Меняет положение каждого пикселя — один из самых эффективных приёмов
+    # против перцептивного хеширования. 0 отключает.
+    unique_crop: int = 0
+    # Зернистость: временной шум на каждый кадр (0..100). 0 отключает. Даже
+    # слабое значение (3-5) заметно сдвигает перцептивный хеш.
+    unique_noise: float = 0.0
+    # Тон: яркость (-1..1), контраст (1.0 — как есть) и гамма (1.0 — как есть).
+    # Малые значения незаметны глазу, но меняют гистограмму кадра.
+    unique_brightness: float = 0.0
+    unique_contrast: float = 1.0
+    unique_gamma: float = 1.0
+    # Поворот оттенка в градусах (-180..180); 0 отключает.
+    unique_hue: float = 0.0
+    # Микро-сдвиг высоты звука в процентах (например 0.5 = на 0.5% выше).
+    # Длительность и синхронизация со видео не меняются — сдвигается только
+    # тембр, а вместе с ним и аудио-отпечаток. 0 отключает.
+    unique_pitch: float = 0.0
+    # Нормализация громкости по стандарту площадок (loudnorm): переписывает
+    # форму волны и заодно приводит громкость к целевому значению.
+    unique_loudness: bool = False
+    # Дополнительный сдвиг громкости в децибелах (0 — без изменений).
+    unique_gain: float = 0.0
+    # Очистить метаданные готового файла и вписать свежий уникальный комментарий
+    # (перезапись контейнера без пере-кодирования). Убирает GPS/устройство/дату
+    # и меняет байтовый хеш файла.
+    unique_metadata: bool = True
+    # Рандомизация: перед каждым рендером параметры уникализации слегка
+    # разбрасываются, поэтому каждый ролик получается отдельным вариантом —
+    # удобно при публикации «одного» клипа на много аккаунтов.
+    unique_randomize: bool = False
+    # Амплитуда разброса при UNIQUE_RANDOMIZE (0..1): 0 — выключено,
+    # 1 — максимальный (но всё ещё незаметный) разброс.
+    unique_jitter: float = 0.5
+
     # Encoding -------------------------------------------------------------
     video_codec: str = "libx264"
     audio_codec: str = "aac"
@@ -448,6 +494,10 @@ _BOOL_FIELDS = {
     "fit_vertical",
     "clip_snap_to_transcript",
     "slide_effect",
+    "unique_mirror",
+    "unique_loudness",
+    "unique_metadata",
+    "unique_randomize",
 }
 _INT_FIELDS = {
     "num_clips",
@@ -461,6 +511,7 @@ _INT_FIELDS = {
     "subtitle_max_words",
     "subtitle_shadow_offset_x",
     "subtitle_shadow_offset_y",
+    "unique_crop",
 }
 _FLOAT_FIELDS = {
     "music_volume",
@@ -485,6 +536,14 @@ _FLOAT_FIELDS = {
     "speed",
     "slide_transition_gap",
     "slide_range",
+    "unique_noise",
+    "unique_brightness",
+    "unique_contrast",
+    "unique_gamma",
+    "unique_hue",
+    "unique_pitch",
+    "unique_gain",
+    "unique_jitter",
 }
 
 
@@ -663,6 +722,24 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("CHROMATIC_ABERRATION must be zero or greater")
     if settings.speed <= 0:
         raise ConfigError("SPEED must be greater than 0")
+    if not 0 <= settings.unique_crop <= 200:
+        raise ConfigError("UNIQUE_CROP must be between 0 and 200 pixels")
+    if not 0.0 <= settings.unique_noise <= 100.0:
+        raise ConfigError("UNIQUE_NOISE must be between 0 and 100")
+    if not -1.0 <= settings.unique_brightness <= 1.0:
+        raise ConfigError("UNIQUE_BRIGHTNESS must be between -1 and 1")
+    if not 0.0 <= settings.unique_contrast <= 3.0:
+        raise ConfigError("UNIQUE_CONTRAST must be between 0 and 3")
+    if not 0.1 <= settings.unique_gamma <= 10.0:
+        raise ConfigError("UNIQUE_GAMMA must be between 0.1 and 10")
+    if not -180.0 <= settings.unique_hue <= 180.0:
+        raise ConfigError("UNIQUE_HUE must be between -180 and 180 degrees")
+    if not -10.0 <= settings.unique_pitch <= 10.0:
+        raise ConfigError("UNIQUE_PITCH must be between -10 and 10 percent")
+    if not -20.0 <= settings.unique_gain <= 20.0:
+        raise ConfigError("UNIQUE_GAIN must be between -20 and 20 dB")
+    if not 0.0 <= settings.unique_jitter <= 1.0:
+        raise ConfigError("UNIQUE_JITTER must be between 0 and 1")
 
 
 # ---------------------------------------------------------------------------

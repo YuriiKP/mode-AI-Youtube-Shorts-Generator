@@ -280,6 +280,116 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_uniqueness_options(parser: argparse.ArgumentParser) -> None:
+    """Anti-duplicate (uniqueness) options shared by the picture commands."""
+    parser.add_argument(
+        "--unique-mirror",
+        dest="unique_mirror",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="mirror the frame horizontally to shift its perceptual hash "
+        "(default: off; also flips any text baked into the video)",
+    )
+    parser.add_argument(
+        "--unique-crop",
+        dest="unique_crop",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="trim PX pixels off every edge and stretch the frame back to its "
+        "original size — the strongest frame-hash mover (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-noise",
+        dest="unique_noise",
+        type=float,
+        default=None,
+        metavar="N",
+        help="temporal grain strength, 0..100 (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-brightness",
+        dest="unique_brightness",
+        type=float,
+        default=None,
+        metavar="N",
+        help="brightness shift, -1..1 (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-contrast",
+        dest="unique_contrast",
+        type=float,
+        default=None,
+        metavar="N",
+        help="contrast multiplier, 1.0 keeps the source (default: 1.0)",
+    )
+    parser.add_argument(
+        "--unique-gamma",
+        dest="unique_gamma",
+        type=float,
+        default=None,
+        metavar="N",
+        help="gamma adjustment, 1.0 keeps the source (default: 1.0)",
+    )
+    parser.add_argument(
+        "--unique-hue",
+        dest="unique_hue",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="hue rotation in degrees, -180..180 (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-pitch",
+        dest="unique_pitch",
+        type=float,
+        default=None,
+        metavar="PERCENT",
+        help="micro pitch shift in percent (e.g. 0.5); changes the audio "
+        "fingerprint without changing the clip length (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-loudness",
+        dest="unique_loudness",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="normalise loudness to a platform-standard level, rewriting the "
+        "waveform (default: off)",
+    )
+    parser.add_argument(
+        "--unique-gain",
+        dest="unique_gain",
+        type=float,
+        default=None,
+        metavar="DB",
+        help="extra audio gain in dB (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-metadata",
+        dest="unique_metadata",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="strip the container tags of the result and stamp a fresh unique "
+        "comment so the file bytes differ (default: on)",
+    )
+    parser.add_argument(
+        "--unique-randomize",
+        dest="unique_randomize",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="jitter every uniqueness value per render so each export is a "
+        "distinct variant (default: off)",
+    )
+    parser.add_argument(
+        "--unique-jitter",
+        dest="unique_jitter",
+        type=float,
+        default=None,
+        metavar="0..1",
+        help="spread used by --unique-randomize (default: 0.5)",
+    )
+
+
 def _add_json(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-json",
@@ -366,6 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whisper language code used when transcribing (default: auto)",
     )
     _add_render_options(subtitles)
+    _add_uniqueness_options(subtitles)
     _add_common(subtitles)
 
     # all -------------------------------------------------------------------
@@ -378,6 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_clip_options(allp)
     _add_music_options(allp)
     _add_render_options(allp)
+    _add_uniqueness_options(allp)
     allp.add_argument(
         "--music-enabled",
         dest="add_music",
@@ -409,6 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_io(preview)
     _add_render_options(preview)
+    _add_uniqueness_options(preview)
     preview.add_argument(
         "--subtitles-enabled",
         dest="add_subtitles",

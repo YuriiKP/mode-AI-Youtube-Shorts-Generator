@@ -3,9 +3,10 @@
 :func:`run` ties the stages together:
 
 1. bake the configured colour/lens effects (``SATURATION`` / ``SHARPNESS`` /
-   ``CHROMATIC_ABERRATION``) and the ``SPEED`` change into the source with a
-   single FFmpeg pass, so the effects land on the video *only* — before any text
-   is drawn — and the audio is re-timed to match;
+   ``CHROMATIC_ABERRATION``), the ``SPEED`` change and the ``UNIQUE_*``
+   anti-duplicate edits into the source with a single FFmpeg pass, so the
+   effects land on the video *only* — before any text is drawn — and the audio
+   is re-timed and re-fingerprinted to match;
 2. resolve the subtitle source (an existing ``.srt`` next to the video, a given
    ``.srt``, or a Whisper transcription when none is found);
 3. re-frame the clip into the vertical frame, filling the empty area with a
@@ -13,7 +14,8 @@
    (``FIT_VERTICAL``);
 4. burn the subtitles and overlay the banner onto the video;
 5. mix a background music track under the existing audio;
-6. write the result to disk.
+6. write the result to disk and — with ``UNIQUE_METADATA`` — strip the container
+   tags and stamp a fresh unique comment, so the file bytes differ too.
 
 The input's own audio is always kept and the music is mixed *under* it, so an
 existing voice-over is never lost. Every stage is optional and independent —
@@ -27,6 +29,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import redirect_stdout
 from typing import List, Optional
 
@@ -39,9 +42,11 @@ from moviepy import (
 from ..config import Settings
 from .banner import banner_kind, build_banner_clips
 from .effects import (
+    Uniqueness,
+    build_audio_filter,
     build_filter_chain,
-    build_speed_audio_filter,
     build_speed_video_filter,
+    resolve_uniqueness,
 )
 from .ffmpeg import configure_ffmpeg
 from .fonts import resolve_font_path
@@ -218,6 +223,55 @@ def _apply_effects_pass(
         _remove_file(temp_path)
         raise
     return temp_path
+
+
+def _finalize_metadata(output_path: str, ffmpeg_binary: str) -> None:
+    """Strip the container tags and stamp a fresh unique comment.
+
+    The encode keeps the input's metadata (device, GPS, creation date) and adds
+    FFmpeg's own encoder tag, and two such files can share a byte hash. A
+    lossless stream-copy remux drops every inherited tag (``-map_metadata -1``),
+    suppresses the encoder stamp (``-fflags +bitexact``) and writes a fresh
+    random comment, so the same edit uploaded twice produces different bytes.
+    Best-effort: a failure is logged and the written video is left untouched.
+    """
+    suffix = os.path.splitext(output_path)[1] or ".mp4"
+    # The temp file must live next to the output: ``os.replace`` cannot move a
+    # file across drives, and ``tempfile``'s default directory is often on a
+    # different drive than the output (e.g. C: temp, E: project).
+    directory = os.path.dirname(output_path) or "."
+    handle, temp_path = tempfile.mkstemp(
+        prefix="shorts_meta_", suffix=suffix, dir=directory
+    )
+    os.close(handle)
+    _remove_file(temp_path)
+
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        output_path,
+        "-map_metadata",
+        "-1",
+        "-fflags",
+        "+bitexact",
+        "-c",
+        "copy",
+        "-metadata",
+        f"comment={uuid.uuid4().hex}",
+        temp_path,
+    ]
+    try:
+        _ = subprocess.run(
+            cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        os.replace(temp_path, output_path)
+        log.info("rewrote container metadata (unique comment)")
+    except Exception as exc:  # pragma: no cover - best effort; keep the video
+        _remove_file(temp_path)
+        log.warning("could not rewrite container metadata: %s", exc)
 
 
 def _open_video(path: str, ffmpeg_binary: str = "ffmpeg") -> tuple[VideoFileClip, str]:
@@ -534,18 +588,23 @@ def run(
     working_path = source_path
     effects_input = ""
     filter_chain = ""
-    speed_audio = ""
+    audio_filter = ""
+    uniqueness: Optional[Uniqueness] = None
     if apply_picture:
-        filter_chain = build_filter_chain(settings)
+        # One resolved set of anti-duplicate parameters is shared by the video
+        # and audio graphs (and the metadata pass), so a randomised render stays
+        # internally consistent.
+        uniqueness = resolve_uniqueness(settings)
+        filter_chain = build_filter_chain(settings, uniqueness)
         speed_video = build_speed_video_filter(settings)
-        speed_audio = build_speed_audio_filter(settings)
         if speed_video:
             filter_chain = (
                 f"{filter_chain},{speed_video}" if filter_chain else speed_video
             )
-        if filter_chain or speed_audio:
+        audio_filter = build_audio_filter(settings, uniqueness)
+        if filter_chain or audio_filter:
             effects_input = _apply_effects_pass(
-                source_path, filter_chain, ffmpeg_binary, audio_filter=speed_audio
+                source_path, filter_chain, ffmpeg_binary, audio_filter=audio_filter
             )
             working_path = effects_input
 
@@ -657,6 +716,11 @@ def run(
             source_fps=float(getattr(video_clip, "fps", 0) or 0.0),
             audio_fps=audio_fps,
         )
+
+        # Final uniqueness touch: rewrite the container tags of the written file
+        # so its bytes differ from any sibling render of the same edit.
+        if uniqueness is not None and uniqueness.metadata:
+            _finalize_metadata(target_path, ffmpeg_binary)
     finally:
         _safe_close(video_clip)
         if music_source is not None:
