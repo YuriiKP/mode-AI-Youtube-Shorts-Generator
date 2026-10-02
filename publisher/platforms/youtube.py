@@ -22,6 +22,7 @@ This module exposes the two coroutines required by
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import List
 
@@ -127,21 +128,40 @@ async def _click_if_present(page, selector: str, timeout: int = 4000) -> bool:
 
 # When an upload cannot proceed, YouTube Studio raises an *error scrim* over the
 # dialog: ``ytcp-uploads-dialog`` gains ``has-error`` / ``show-error-scrim`` and
-# shows ``#error-block`` / ``#error-message`` ("Oops, something went wrong.")
-# together with a specific reason in ``.error-short`` and ``.error-details``
-# (e.g. "Daily upload limit reached" / "Upload more videos daily after a one-time
-# verification or wait 24 hours."). That scrim swallows every click, so without
-# this the flow merely times out looking for a button it can no longer reach —
-# reading the reason makes the failure actionable instead.
+# shows the error area with a specific reason in ``.error-short`` /
+# ``.error-details`` (e.g. "Daily upload limit reached" / "Upload more videos
+# daily after a one-time verification or wait 24 hours."). That scrim swallows
+# every click, so without this the flow merely times out looking for a button it
+# can no longer reach — reading the reason makes the failure actionable instead.
+#
+# The trap, which used to break *healthy* uploads, is that Studio keeps the error
+# markup in the dialog the whole time: ``#error-block`` and its ``#error-message``
+# ("Oops, something went wrong.") are always present, merely collapsed to 0x0 and
+# un-shown until an upload is really refused. So the error is only taken as real
+# when the dialog actually flags it (``has-error`` / ``show-error-scrim``) or the
+# error area is genuinely rendered; a hidden placeholder is ignored, and its text
+# is never read.
 _DIALOG_ERROR_STATE_JS = """() => {
     const host = document.querySelector('ytcp-uploads-dialog');
     if (!host) return { text: '', specific: false };
     const clean = (el) => el ? (el.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+    // A node only counts when it is actually painted: the placeholders sit in the
+    // DOM but measure 0x0, so their mere presence must never be trusted.
+    const isVisible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 3 || rect.height < 3) return false;
+        const style = getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && style.opacity !== '0';
+    };
     // Several of these selectors match more than one node, and the first match
-    // can be an empty placeholder (e.g. an ``.error-details`` carrying no text),
-    // so take the first *non-empty* match of each.
+    // can be a hidden or empty placeholder (e.g. the generic ``#error-message``
+    // or an ``.error-details`` carrying no text), so take the first *visible,
+    // non-empty* match of each.
     const firstText = (selector) => {
         for (const el of host.querySelectorAll(selector)) {
+            if (!isVisible(el)) continue;
             const text = clean(el);
             if (text) return text;
         }
@@ -150,16 +170,17 @@ _DIALOG_ERROR_STATE_JS = """() => {
     const short = firstText('.error-short');
     const details = firstText('.error-details');
     const generic = firstText('#error-message');
-    const block = host.querySelector('#error-block, .error-area');
+    const visibleBlock = [...host.querySelectorAll('#error-block, .error-area')]
+        .find(isVisible) || null;
     const flagged = host.hasAttribute('has-error')
-        || host.hasAttribute('show-error-scrim') || !!block;
+        || host.hasAttribute('show-error-scrim') || !!visibleBlock;
     if (!flagged) return { text: '', specific: false };
     const parts = [];
     if (short) parts.push(short);
     if (generic && !parts.includes(generic)) parts.push(generic);
     if (details && !parts.includes(details)) parts.push(details);
-    if (!parts.length && block) {
-        const text = clean(block);
+    if (!parts.length && visibleBlock) {
+        const text = clean(visibleBlock);
         if (text) parts.push(text);
     }
     // ``specific`` is true once Studio has filled in the actual reason
@@ -231,6 +252,50 @@ async def _wait_dialog_error(page, attempts: int = 8, settle_reads: int = 3) -> 
                 return best
         await human.pause(page, 300, 600)
     return best
+
+
+# How long to wait for the *details* form before giving up. Studio shows it only
+# once the file has been accepted, and a large clip can take a while — but a
+# refusal must never be waited out.
+_DETAILS_TIMEOUT_S = 120.0
+
+
+async def _wait_details_or_refusal(page, timeout: float = _DETAILS_TIMEOUT_S) -> str:
+    """Wait for the upload *details* form, or catch a refusal on the spot.
+
+    Studio opens the details dialog a moment after the file is chosen. When the
+    account has hit its daily upload limit — or the upload is otherwise refused —
+    it does not: it throws an error scrim over the dialog instead. The form is
+    then covered by a pale veil and can stay unreachable, while the reason
+    ("Daily upload limit reached — Upload more videos daily after a one-time
+    verification or wait 24 hours.") is shown at the bottom of the dialog.
+
+    Waiting only for ``#title-textarea`` in that case blocks for the whole
+    timeout on a form that never becomes usable, which reads as a hang. So this
+    polls for *either* outcome and returns the refusal text the moment it
+    appears, or ``""`` as soon as the details form is up and healthy. If neither
+    happens within ``timeout`` a :class:`TimeoutError` is raised, so the caller's
+    error handler still gets a chance to read a late-appearing reason.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        # A refusal wins over the form: Studio can paint the scrim *over* a form
+        # that is technically still visible, and it must be reported, not driven.
+        error = await _dialog_error(page)
+        if error:
+            return error
+        try:
+            box = page.locator("#title-textarea").first
+            if await box.count() and await box.is_visible():
+                return ""
+        except Exception:  # noqa: BLE001 - a box that is not up yet is not an error
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "the YouTube upload dialog never showed its details form"
+            )
+        # Short, jittered polling so an early refusal is caught within ~1s.
+        await human.pause(page, 700, 1300)
 
 
 async def _wait_upload_complete(page, max_polls: int = _MAX_UPLOAD_POLLS) -> bool:
@@ -448,6 +513,30 @@ def _normalize_spaces(text: str) -> str:
     return (text or "").replace("\u202f", " ").replace("\xa0", " ").strip()
 
 
+_TIME_RE = re.compile(r"^0?(\d{1,2}):(\d{2})\s*(AM|PM)$")
+
+
+def _same_time(expected: str, shown: str) -> bool:
+    """Whether a Studio time field shows ``expected``, ignoring its formatting.
+
+    Studio renders the chosen time without a leading zero (``6:00 AM``) and with a
+    narrow no-break space before the meridiem, whereas the value we typed is
+    zero-padded (``06:00 AM``); the field is re-rendered — and so reformatted — the
+    moment the picker is dismissed, which made a plain substring test miss. Both
+    sides are therefore folded to ``H:MM AM/PM`` before comparing.
+    """
+
+    def canonical(text: str) -> str:
+        folded = _normalize_spaces(text).upper()
+        match = _TIME_RE.match(folded)
+        if not match:
+            return folded
+        hour, minute, meridiem = match.groups()
+        return f"{int(hour)}:{minute} {meridiem}"
+
+    return canonical(expected) == canonical(shown)
+
+
 async def _page_truthy(page, script: str) -> bool:
     """Best-effort boolean page evaluation (``False`` when the page is gone)."""
     try:
@@ -624,6 +713,59 @@ async def _set_schedule_date(page, schedule_at) -> bool:
     return False
 
 
+#: Studio's time-of-day picker popup, opened when the time field is used. It is
+#: left open after a value is entered, and its ``tp-yt-iron-overlay-backdrop`` is
+#: stacked *above* the upload dialog — so while it is up every control in the
+#: dialog, "Schedule" included, is unreachable and a click merely times out on the
+#: veil (the same pale overlay that also hides the form).
+_TIME_PICKER_OPEN_JS = """() => {
+    const dialog = document.querySelector(
+        'ytcp-time-of-day-picker tp-yt-paper-dialog#dialog'
+    );
+    if (!dialog) return false;
+    const rect = dialog.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+}"""
+
+
+async def _time_picker_open(page) -> bool:
+    """Whether Studio's time-of-day picker popup is covering the dialog."""
+    return await _page_truthy(page, _TIME_PICKER_OPEN_JS)
+
+
+async def _dismiss_time_picker(page) -> None:
+    """Close the time-of-day picker popup so the dialog becomes usable again.
+
+    After the publish time is typed, Studio leaves this small popup open over the
+    dialog; because its backdrop sits above the dialog, the "Schedule" button (and
+    everything else) cannot be clicked until the popup is gone — which is exactly
+    how a scheduled upload ends up never pressing Schedule. A person dismisses it
+    by clicking the empty space beside the popup, so that is what happens here: a
+    click on the overlay backdrop, well away from the small popup, with ``Escape``
+    as a fallback (it closes the topmost overlay — the picker — not the upload
+    dialog). Best-effort: if the popup cannot be closed, the caller's next click
+    fails loudly instead of misbehaving silently.
+    """
+    if not await _time_picker_open(page):
+        return
+
+    # 1) The human way: click the empty backdrop, far from the popup.
+    try:
+        await page.mouse.click(4, 4)
+        await human.pause(page, 250, 500)
+    except Exception:  # noqa: BLE001 - best effort
+        pass
+    if not await _time_picker_open(page):
+        return
+
+    # 2) Fallback: Escape closes the topmost overlay, which is the picker.
+    try:
+        await page.keyboard.press("Escape")
+        await human.pause(page, 250, 500)
+    except Exception:  # noqa: BLE001 - best effort
+        pass
+
+
 async def _set_schedule_time(page, schedule_at) -> bool:
     """Type the publish time into the time field and commit it by blurring."""
     wanted = _expected_time_text(schedule_at)
@@ -640,8 +782,15 @@ async def _set_schedule_time(page, schedule_at) -> bool:
         # whole flow without scheduling anything.
         await page.keyboard.press("Tab")
         await human.pause(page, 400, 800)
-        value = _normalize_spaces(await page.locator(_TIME_INPUT).first.input_value())
-        return _normalize_spaces(wanted) in value
+        # Using the field opens Studio's time-of-day picker, and it stays open
+        # afterwards: its backdrop is stacked above the dialog, so the "Schedule"
+        # button cannot be clicked until it is dismissed. Click the empty space
+        # beside the popup (with Escape as a fallback) before reading the value.
+        await _dismiss_time_picker(page)
+        value = await page.locator(_TIME_INPUT).first.input_value()
+        # Studio reformats the value as soon as the picker is dismissed (``06:00
+        # AM`` becomes ``6:00 AM``), so compare tolerantly rather than by substring.
+        return _same_time(wanted, value)
     except Exception:  # noqa: BLE001 - reported to the caller
         return False
 
@@ -697,13 +846,18 @@ async def upload(
         await human.pause(page, 700, 1500)  # a beat before picking the file
         await file_input.set_input_files(file_path)
 
-        # 2) wait for the details dialog ------------------------------------------
-        await page.locator("#title-textarea").wait_for(state="visible", timeout=120000)
+        # 2) wait for the details dialog, or fail fast on an immediate refusal ---
+        # A refused upload raises the error scrim over the dialog — a pale veil
+        # that swallows every click — and leaves the reason at its bottom (e.g.
+        # "Daily upload limit reached"). That must be reported with YouTube's own
+        # words instead of being waited out, so the form and the refusal are
+        # polled for together and a refusal ends the attempt at once.
+        refusal = await _wait_details_or_refusal(page)
+        if refusal:
+            return UploadResult.failure(f"YouTube refused the upload: {refusal}")
 
-        # A refused upload raises the error scrim over the dialog, which swallows
-        # every click. Wait here so that case fails with YouTube's own reason
-        # (e.g. "Daily upload limit reached") instead of a 60s click timeout on
-        # the title box. A healthy dialog returns immediately.
+        # The form is up; still confirm no scrim is being raised a beat later (a
+        # healthy dialog returns immediately).
         error = await _wait_dialog_error(page)
         if error:
             return UploadResult.failure(f"YouTube refused the upload: {error}")
