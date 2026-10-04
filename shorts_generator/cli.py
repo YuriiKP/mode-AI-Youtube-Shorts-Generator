@@ -161,10 +161,11 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--visual-indexer-type",
         dest="visual_indexer_type",
-        choices=("florence", "gemini", "gemini_video", "none"),
+        choices=("florence", "gemini", "gemini_video", "qwen_video", "none"),
         default=None,
-        help="visual indexer engine: florence (local, transformers/torch) or "
-        "gemini (cloud, google-genai) (default: florence)",
+        help="visual indexer engine: florence / qwen_video (local, "
+        "transformers/torch) or gemini / gemini_video (cloud, google-genai) "
+        "(default: florence)",
     )
     parser.add_argument(
         "--visual-indexer-model",
@@ -189,8 +190,8 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="PX",
         help="downscale the frames (and the gemini_video upload) to at most "
-        "this height before the model sees them: 0 keeps the source resolution "
-        "(default: 0)",
+        "this height before the model sees them (applies to qwen_video frames "
+        "too): 0 keeps the source resolution (default: 0)",
     )
 
 

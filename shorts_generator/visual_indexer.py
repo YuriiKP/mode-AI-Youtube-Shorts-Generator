@@ -16,6 +16,10 @@ The engine is chosen with ``VISUAL_INDEXER_TYPE`` in ``.env`` using the
   batches with the shared :data:`VISUAL_PROMPT`;
 * ``gemini_video`` — cloud, the whole file is uploaded to the Gemini Files API
   (up to 2 GB) and described in a single request;
+* ``qwen_video`` — local, ``Qwen2.5-VL`` via ``transformers`` + ``torch``; the
+  video is cut into ``VISUAL_INDEXER_MAX_SCENE_SECONDS`` windows and each
+  window's sampled frames are described in their own request, then the per-window
+  timelines are concatenated into one index;
 * ``none``     — disabled (same as ``VISUAL_INDEXER_ENABLED=false``).
 
 Everything here is optional: the heavy libraries (``transformers``, ``torch``,
@@ -45,6 +49,7 @@ __all__ = [
     "FlorenceIndexer",
     "GeminiFlashIndexer",
     "GeminiVideoIndexer",
+    "QwenVideoIndexer",
     "build_visual_indexer",
     "index_video",
     "detect_scenes",
@@ -73,6 +78,15 @@ GEMINI_RETRY_BACKOFF = 2.0
 # long to wait for the video to finish processing.
 GEMINI_VIDEO_POLL_SECONDS = 2.0
 GEMINI_UPLOAD_TIMEOUT_SECONDS = 900.0
+# Qwen2.5-VL engine (``qwen_video``): fallback checkpoint used only when
+# VISUAL_INDEXER_MODEL is empty, a fallback window length, and the generation cap.
+# The engine carries no settings of its own — it reuses the shared knobs: the
+# window length is VISUAL_INDEXER_MAX_SCENE_SECONDS and the frames per window are
+# VISUAL_INDEXER_BATCH_SIZE; the model and device are VISUAL_INDEXER_MODEL /
+# VISUAL_INDEXER_DEVICE, exactly like the local Florence engine.
+DEFAULT_QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+DEFAULT_QWEN_WINDOW_SECONDS = 15.0
+DEFAULT_QWEN_MAX_NEW_TOKENS = 1024
 
 # Задача Florence-2 для каждого взятого кадра. <MORE_DETAILED_CAPTION> возвращает
 # целый абзац на кадр (до 1024 токенов); в логе ранжирования такие простыни
@@ -355,12 +369,14 @@ def detect_scenes(
     """Return the scene windows ``(start, end)`` of a video.
 
     Uses PySceneDetect when available and falls back to a small OpenCV
-    frame-difference detector otherwise. When ``max_seconds`` is set, scenes
-    longer than that are split so sampled frames cover the whole clip (a
+    frame-difference detector otherwise. ``threshold`` tunes both paths: it is
+    handed to PySceneDetect's ContentDetector when the library is installed and
+    to the OpenCV difference detector otherwise. When ``max_seconds`` is set,
+    scenes longer than that are split so sampled frames cover the whole clip (a
     talking-head video is often a single very long scene).
     """
     try:
-        scenes = _scenes_with_scenedetect(video_path)
+        scenes = _scenes_with_scenedetect(video_path, threshold=threshold)
     except Exception:
         scenes = _scenes_with_opencv(video_path, threshold=threshold)
     if max_seconds and max_seconds > 0:
@@ -368,13 +384,22 @@ def detect_scenes(
     return scenes
 
 
-def _scenes_with_scenedetect(video_path: str) -> List[SceneSpan]:
+def _scenes_with_scenedetect(
+    video_path: str, *, threshold: float = DEFAULT_SCENE_THRESHOLD
+) -> List[SceneSpan]:
+    """Detect cuts with PySceneDetect, honoring ``threshold`` for content cuts."""
     from scenedetect import SceneManager, open_video  # type: ignore
     from scenedetect.detectors import ContentDetector, ThresholdDetector  # type: ignore
 
     video = open_video(video_path)
     manager = SceneManager()
-    manager.add_detector(ContentDetector())
+    # Forward VISUAL_INDEXER_SCENE_THRESHOLD to the cut detector: ContentDetector
+    # scores cuts on the same content_val scale as the setting (its own default
+    # is ~27, the value the .env ships with), so raising the threshold now merges
+    # nearby cuts instead of being silently ignored. ThresholdDetector keeps its
+    # own default — its threshold is a luminance cut-off in a different range, so
+    # the content threshold does not apply to it.
+    manager.add_detector(ContentDetector(threshold=threshold))
     manager.add_detector(ThresholdDetector())
     manager.detect_scenes(video)
     return [
@@ -482,6 +507,18 @@ def _gemini_dependency_message(engine: str, exc: ImportError) -> str:
     )
 
 
+def _qwen_dependency_message(exc: ImportError) -> str:
+    return (
+        "VISUAL_INDEXER_TYPE=qwen_video needs 'transformers', 'torch' and "
+        f"'qwen-vl-utils', but importing them failed: {exc}\n"
+        f"Interpreter: {sys.executable}\n"
+        "Install the packages into THAT interpreter, then re-run:\n"
+        f"    {_install_hint('transformers torch qwen-vl-utils')}\n"
+        "Qwen2.5-VL needs transformers>=4.49, while Florence-2 in the same venv "
+        "needs <4.54, so 'transformers>=4.49,<4.54' keeps both working."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider error classification
 #
@@ -552,26 +589,37 @@ def _is_retryable_provider_error(exc: Exception) -> bool:
     return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
 
 
-def _non_retryable_error(engine: str, model: str, exc: Exception) -> RuntimeError:
-    """Turn a permanent provider error into a clear, actionable ``RuntimeError``."""
+def _non_retryable_error(
+    engine: str,
+    model: str,
+    exc: Exception,
+    *,
+    key_env: str = "GEMINI_API_KEY",
+    model_env: str = "GEMINI_MODEL",
+) -> RuntimeError:
+    """Turn a permanent provider error into a clear, actionable ``RuntimeError``.
+
+    ``key_env`` / ``model_env`` name the ``.env`` variables the caller's engine
+    reads, so the fix-it hint points at the right key for Gemini and Qwen alike.
+    """
     status = _provider_http_status(exc)
     what = f"HTTP {status}" if status is not None else "non-retryable error"
     message = f"{engine} request failed with a {what} that retrying cannot fix: {exc}"
     text = str(exc).lower()
     if status in (401, 403) or "api key" in text or "permission" in text:
         message += (
-            "\nCheck GEMINI_API_KEY in .env — the key looks rejected or lacks "
+            f"\nCheck {key_env} in .env — the key looks rejected or lacks "
             "access to this API."
         )
     elif status == 404 or "not found" in text or "no longer available" in text:
         message += (
-            f"\nThe model {model!r} (GEMINI_MODEL in .env) is not available to "
-            "this key — it may be retired or renamed. Update GEMINI_MODEL and "
+            f"\nThe model {model!r} ({model_env} in .env) is not available to "
+            f"this key — it may be retired or renamed. Update {model_env} and "
             "re-run."
         )
     elif status == 400:
         message += (
-            f"\nThe request was rejected as malformed; check GEMINI_MODEL ({model!r})."
+            f"\nThe request was rejected as malformed; check {model_env} ({model!r})."
         )
     return RuntimeError(message)
 
@@ -950,6 +998,11 @@ def _visual_cache_signature(settings: Settings) -> Dict[str, Any]:
     engine, model or scene policy automatically invalidates the old file.
     """
     kind = (settings.visual_indexer_type or "florence").strip().lower()
+    # Only gemini_video ignores the scene policy: it describes the whole file in
+    # segments the model picks itself. Every other engine is shaped by the shared
+    # visual-indexer knobs below.
+    whole_video = kind in ("gemini_video", "gemini-video", "video")
+    qwen = kind in ("qwen_video", "qwen-video", "qwen", "qwen2.5-vl", "qwen2_5_vl")
     if kind in (
         "gemini",
         "gemini_flash",
@@ -960,16 +1013,31 @@ def _visual_cache_signature(settings: Settings) -> Dict[str, Any]:
     ):
         model = settings.gemini_model
     else:
+        # florence and qwen_video share VISUAL_INDEXER_MODEL.
         model = settings.visual_indexer_model
-    return {
+    signature: Dict[str, Any] = {
         "engine": kind,
         "model": model,
-        "scene_threshold": round(float(settings.visual_indexer_scene_threshold), 3),
-        "max_scene_seconds": round(float(settings.visual_indexer_max_scene_seconds), 3),
         # The frame/upload height cap changes the sampled images, so a different
-        # VISUAL_INDEXER_MAX_HEIGHT must invalidate the cached index.
+        # VISUAL_INDEXER_MAX_HEIGHT must invalidate the cached index. It applies
+        # to every engine, gemini_video included (the upload is re-encoded).
         "max_height": int(getattr(settings, "visual_indexer_max_height", 0) or 0),
     }
+    # Every engine but gemini_video is shaped by the scene-window length: florence
+    # and gemini sample frames per scene, qwen_video uses it as its request window.
+    if not whole_video:
+        signature["max_scene_seconds"] = round(
+            float(settings.visual_indexer_max_scene_seconds), 3
+        )
+    # The scene threshold only drives scene detection for the frame-based engines.
+    if not whole_video and not qwen:
+        signature["scene_threshold"] = round(
+            float(settings.visual_indexer_scene_threshold), 3
+        )
+    # Frames per request: gemini batches frames, qwen_video samples frames per window.
+    if qwen or kind in ("gemini", "gemini_flash", "gemini-flash"):
+        signature["batch_size"] = int(settings.visual_indexer_batch_size)
+    return signature
 
 
 def _load_visual_cache(video_path: str, settings: Settings) -> Optional[Dict[str, Any]]:
@@ -1067,9 +1135,11 @@ def build_visual_indexer(
         return GeminiFlashIndexer(video_path, settings)
     if kind in ("gemini_video", "gemini-video", "video"):
         return GeminiVideoIndexer(video_path, settings)
+    if kind in ("qwen_video", "qwen-video", "qwen", "qwen2.5-vl", "qwen2_5_vl"):
+        return QwenVideoIndexer(video_path, settings)
     raise ConfigError(
         f"Unknown VISUAL_INDEXER_TYPE={kind!r}; use 'florence', 'gemini', "
-        "'gemini_video' or 'none'."
+        "'gemini_video', 'qwen_video' or 'none'."
     )
 
 
@@ -1356,6 +1426,50 @@ def format_merged_log(entries: Sequence[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _parse_timeline(raw: str, duration: float) -> List[Dict[str, Any]]:
+    """Parse a model's ``{"scenes": [...]}`` reply into ``start/end/text`` scenes.
+
+    Shared by the whole-video engines (Gemini and Qwen). Tolerates a bare list,
+    missing keys and reversed bounds; when nothing parses but the model did return
+    prose, that text is kept as a single segment covering ``duration`` (so it is
+    not silently dropped).
+    """
+    data: Any = None
+    try:
+        data = json.loads(_strip_fences(raw))
+    except (ValueError, TypeError):
+        data = None
+
+    items: Any = None
+    if isinstance(data, dict):
+        items = data.get("scenes") or data.get("moments") or data.get("segments")
+    elif isinstance(data, list):
+        items = data
+
+    results: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or item.get("description") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(item.get("start", 0.0))
+            end = float(item.get("end", start))
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        if end < start:
+            start, end = end, start
+        if end <= start:
+            end = start + 1.0
+        results.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+
+    if not results and raw.strip():
+        whole = duration if duration and duration > 0 else 1e9
+        results = [{"start": 0.0, "end": round(whole, 3), "text": raw.strip()[:1000]}]
+    return results
+
+
 class GeminiVideoIndexer(BaseVisualIndexer):
     """Cloud engine: upload the whole video (Files API) and describe it at once.
 
@@ -1524,44 +1638,7 @@ class GeminiVideoIndexer(BaseVisualIndexer):
         ) from last_error
 
     def _parse_timeline(self, raw: str, duration: float) -> List[Dict[str, Any]]:
-        data: Any = None
-        try:
-            data = json.loads(_strip_fences(raw))
-        except (ValueError, TypeError):
-            data = None
-
-        items: Any = None
-        if isinstance(data, dict):
-            items = data.get("scenes") or data.get("moments") or data.get("segments")
-        elif isinstance(data, list):
-            items = data
-
-        results: List[Dict[str, Any]] = []
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            text = str(item.get("text") or item.get("description") or "").strip()
-            if not text:
-                continue
-            try:
-                start = float(item.get("start", 0.0))
-                end = float(item.get("end", start))
-            except (TypeError, ValueError):
-                start, end = 0.0, 0.0
-            if end < start:
-                start, end = end, start
-            if end <= start:
-                end = start + 1.0
-            results.append(
-                {"start": round(start, 3), "end": round(end, 3), "text": text}
-            )
-
-        if not results and raw.strip():
-            whole = duration if duration and duration > 0 else 1e9
-            results = [
-                {"start": 0.0, "end": round(whole, 3), "text": raw.strip()[:1000]}
-            ]
-        return results
+        return _parse_timeline(raw, duration)
 
 
 def _file_state(video_file: Any) -> str:
@@ -1571,3 +1648,301 @@ def _file_state(video_file: Any) -> str:
     if name is None and isinstance(state, str):
         return state
     return str(name or "")
+
+
+# ---------------------------------------------------------------------------
+# Local engine: Qwen2.5-VL, described chunk by chunk
+# ---------------------------------------------------------------------------
+
+
+def _qwen_windows(duration: float, chunk_seconds: float) -> List[SceneSpan]:
+    """Cut ``[0, duration]`` into consecutive windows of ``chunk_seconds``."""
+    size = max(1.0, float(chunk_seconds))
+    windows: List[SceneSpan] = []
+    start = 0.0
+    while start < duration - 1e-6:
+        end = min(duration, start + size)
+        windows.append((start, end))
+        start = end
+    return windows or [(0.0, max(duration, 0.0))]
+
+
+def _map_window_timeline(raw: str, start: float, end: float) -> List[Dict[str, Any]]:
+    """Turn one window's model reply into absolute ``start/end/text`` scenes.
+
+    The prompt asks for times relative to the window, but models occasionally
+    answer with absolute seconds anyway; both are accepted (a reply whose times
+    already sit inside ``[start, end]`` is read as absolute). Whatever comes back
+    is clamped to the window so concatenated windows stay monotonic.
+    """
+    window_len = max(0.001, float(end) - float(start))
+    segments = _parse_timeline(raw, window_len)
+    if not segments:
+        return []
+
+    starts = [float(seg.get("start", 0.0)) for seg in segments]
+    absolute = start > 0 and bool(starts) and min(starts) >= start - 1.0
+
+    mapped: List[Dict[str, Any]] = []
+    for seg in segments:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        if not absolute:
+            seg_start += start
+            seg_end += start
+        seg_start = min(max(seg_start, start), end)
+        seg_end = min(max(seg_end, start), end)
+        if seg_end <= seg_start:
+            seg_end = min(end, seg_start + 1.0)
+        if seg_end <= seg_start:
+            continue
+        mapped.append(
+            {"start": round(seg_start, 3), "end": round(seg_end, 3), "text": text}
+        )
+    return mapped
+
+
+class QwenVideoIndexer(BaseVisualIndexer):
+    """Local engine: ``Qwen2.5-VL`` (``transformers``) on CUDA when available.
+
+    Qwen2.5-VL understands video, but a whole long video in one request overflows
+    the context window (and the GPU memory). So the timeline is cut into windows of
+    ``VISUAL_INDEXER_MAX_SCENE_SECONDS`` seconds; each window's frames (up to
+    ``VISUAL_INDEXER_BATCH_SIZE`` of them) are described in their own request,
+    which returns a short ``{"scenes": ...}`` timeline for that window. The
+    per-window timelines are then stitched into one index — the same shape
+    :class:`GeminiVideoIndexer` produces, just split so the video never has to fit
+    in a single call.
+
+    The engine carries no settings of its own: the checkpoint is
+    ``VISUAL_INDEXER_MODEL`` (a Hugging Face repo id), loaded on
+    ``VISUAL_INDEXER_DEVICE`` (auto | cpu | cuda) like :class:`FlorenceIndexer`,
+    and the window length / frames per window are
+    ``VISUAL_INDEXER_MAX_SCENE_SECONDS`` / ``VISUAL_INDEXER_BATCH_SIZE``.
+    """
+
+    name = "qwen_video"
+
+    def __init__(self, video_path: str, settings: Settings) -> None:
+        super().__init__(video_path, settings)
+        self._torch = None
+        self._model = None
+        self._processor = None
+        self._device = "cpu"
+
+    # -- model loading -----------------------------------------------------
+    def preflight(self) -> None:
+        """Check torch/transformers before scene detection touches the video."""
+        try:
+            import qwen_vl_utils  # type: ignore  # noqa: F401
+            import torch  # type: ignore  # noqa: F401
+            from transformers import (  # type: ignore
+                AutoProcessor,  # noqa: F401
+                Qwen2_5_VLForConditionalGeneration,  # noqa: F401
+            )
+        except ImportError as exc:
+            raise VisualIndexerSetupError(_qwen_dependency_message(exc)) from exc
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        try:
+            import torch  # type: ignore
+            from transformers import (  # type: ignore
+                AutoProcessor,
+                Qwen2_5_VLForConditionalGeneration,
+            )
+        except ImportError as exc:
+            # Reached only when preflight() was skipped (e.g. a direct API call).
+            raise VisualIndexerSetupError(_qwen_dependency_message(exc)) from exc
+
+        model_name = self.settings.visual_indexer_model or DEFAULT_QWEN_MODEL
+        device = self._resolve_device(torch)
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        print(
+            f"[visual] loading Qwen model={model_name} device={device}",
+            flush=True,
+        )
+        try:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=dtype
+            )
+            model = model.to(device)
+        except RuntimeError as exc:
+            if device == "cuda" and "out of memory" in str(exc).lower():
+                print(
+                    "[visual] CUDA out of memory loading Qwen; retrying on CPU",
+                    flush=True,
+                )
+                torch.cuda.empty_cache()
+                device, dtype = "cpu", torch.float32
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    model_name, torch_dtype=dtype
+                ).to(device)
+            else:
+                raise RuntimeError(
+                    f"could not load Qwen model {model_name!r}: {exc}"
+                ) from exc
+        model.eval()
+        processor = AutoProcessor.from_pretrained(model_name)
+
+        self._torch = torch
+        self._model = model
+        self._processor = processor
+        self._device = device
+
+    def _resolve_device(self, torch) -> str:
+        requested = (self.settings.visual_indexer_device or "auto").strip().lower()
+        if requested == "cpu":
+            return "cpu"
+        if requested == "cuda":
+            if torch.cuda.is_available():
+                return "cuda"
+            print("[visual] CUDA requested but unavailable; using CPU", flush=True)
+            return "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    # -- inference ---------------------------------------------------------
+    def index(self, scenes: Sequence[SceneSpan]) -> Dict[str, Any]:
+        scenes = list(scenes)
+        if not scenes:
+            return {"engine": self.name, "scenes": []}
+        self._load()
+
+        duration = _probe_duration(self.video_path) or max(
+            (float(end) for _, end in scenes), default=0.0
+        )
+        if duration > 0:
+            windows = _qwen_windows(duration, self._window_seconds())
+        else:
+            # Unreadable duration: fall back to the windows handed over.
+            windows = [(float(start), float(end)) for start, end in scenes]
+        if not windows:
+            return {"engine": self.name, "scenes": []}
+
+        per_window = self._frames_per_window()
+        described: List[Dict[str, Any]] = []
+        with _FrameExtractor(self.video_path, self._frame_max_height()) as extractor:
+            for start, end in windows:
+                sampled = self._sample_frames(extractor, start, end, per_window)
+                if not sampled:
+                    continue
+                described.extend(self._describe_window(start, end, sampled))
+        return {"engine": self.name, "scenes": described}
+
+    # -- tunables (shared with the other engines) --------------------------
+    def _window_seconds(self) -> float:
+        """Window length; reuses VISUAL_INDEXER_MAX_SCENE_SECONDS."""
+        try:
+            value = float(self.settings.visual_indexer_max_scene_seconds or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return value if value > 0 else DEFAULT_QWEN_WINDOW_SECONDS
+
+    def _frames_per_window(self) -> int:
+        """Frames sampled per window; reuses VISUAL_INDEXER_BATCH_SIZE."""
+        try:
+            value = int(self.settings.visual_indexer_batch_size or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return max(1, value)
+
+    def _sample_frames(self, extractor, start: float, end: float, count: int):
+        """Return ``[(timestamp, rgb), ...]`` spread evenly across the window."""
+        span = max(0.0, float(end) - float(start))
+        if span <= 0:
+            timestamps = [float(start)]
+        else:
+            step = span / count
+            timestamps = [float(start) + step * (i + 0.5) for i in range(count)]
+        frames: List[Tuple[float, Any]] = []
+        for ts in timestamps:
+            rgb = extractor.frame_rgb(ts)
+            if rgb is not None:
+                frames.append((ts, rgb))
+        return frames
+
+    def _describe_window(
+        self, start: float, end: float, sampled
+    ) -> List[Dict[str, Any]]:
+        messages = self._build_messages(start, end, sampled)
+        raw = self._generate(messages)
+        return _map_window_timeline(raw, start, end)
+
+    def _build_messages(self, start: float, end: float, sampled):
+        from PIL import Image  # type: ignore
+
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": self._window_prompt(start, end, len(sampled))}
+        ]
+        for ts, rgb in sampled:
+            content.append({"type": "text", "text": f"Frame at {ts - start:.1f}s:"})
+            content.append({"type": "image", "image": Image.fromarray(rgb)})
+        return [{"role": "user", "content": content}]
+
+    def _generate(self, messages) -> str:
+        """Run the model, moving it to CPU and retrying once on CUDA OOM."""
+        try:
+            return self._run(messages)
+        except RuntimeError as exc:
+            torch = self._torch
+            if self._device == "cuda" and "out of memory" in str(exc).lower():
+                print(
+                    "[visual] CUDA out of memory during Qwen inference; moving "
+                    "Qwen to CPU for the rest of the run",
+                    flush=True,
+                )
+                torch.cuda.empty_cache()
+                self._model.to("cpu")
+                self._device = "cpu"
+                return self._run(messages)
+            raise
+
+    def _run(self, messages) -> str:
+        from qwen_vl_utils import process_vision_info  # type: ignore
+
+        processor = self._processor
+        model = self._model
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._device)
+        with self._torch.no_grad():
+            generated_ids = model.generate(
+                **inputs, max_new_tokens=DEFAULT_QWEN_MAX_NEW_TOKENS
+            )
+        trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        decoded = processor.batch_decode(
+            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        return decoded[0] if decoded else ""
+
+    @staticmethod
+    def _window_prompt(start: float, end: float, frames: int) -> str:
+        return (
+            f"{VISUAL_PROMPT}\n\n"
+            f"This is a clip from the full video, covering {start:.1f}s to "
+            f"{end:.1f}s, shown as {frames} evenly spaced frames. The line before "
+            "each frame gives its time from the START OF THIS CLIP.\n"
+            "Split this clip into consecutive segments and describe what happens "
+            "on screen in each. Give every start and end time in SECONDS RELATIVE "
+            "TO THE START OF THIS CLIP (0 = the clip's first moment), NOT the "
+            "absolute time in the full video.\n"
+            'Return ONLY JSON of the form {"scenes": [{"start": <seconds>, '
+            '"end": <seconds>, "text": "..."}, ...]} ordered by time, each text '
+            "at most 2-3 sentences in English."
+        )

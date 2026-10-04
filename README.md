@@ -39,9 +39,10 @@ MUSIC=music               # файл с музыкой или папка (нео
 один запуск.
 
 Опциональная индексация визуала включается через `VISUAL_INDEXER_ENABLED=true` и
-движок `VISUAL_INDEXER_TYPE` (`florence` — локально, `gemini` — облако по
-кадрам, `gemini_video` — облако целиком, `none` — выключено). Остальные
-ключи — `VISUAL_INDEXER_*` в `.env.example`.
+движок `VISUAL_INDEXER_TYPE` (`florence` — локально Florence-2, `gemini` —
+облако по кадрам, `gemini_video` — облако целиком, `qwen_video` — локально
+Qwen2.5-VL по чанкам, `none` — выключено). Остальные ключи — `VISUAL_INDEXER_*`
+в `.env.example`.
 
 Результат индексации визуала кэшируется в `OUTPUT_DIR` (`<video>.visual.json`,
 например `video/talk.mkv` → `output/talk.visual.json`) — так же, как транскрипт
@@ -380,7 +381,15 @@ python main.py clip --slide --slide-range 0.5
    графику. Движок — локальный Florence-2 (`VISUAL_INDEXER_TYPE=florence`,
    `transformers` + `torch`) или облачный Gemini Flash — по кадрам
    (`VISUAL_INDEXER_TYPE=gemini`) либо целиком по видеофайлу
-   (`VISUAL_INDEXER_TYPE=gemini_video`, Files API). Описания подмешиваются к
+   (`VISUAL_INDEXER_TYPE=gemini_video`, Files API). Отдельный локальный движок
+   `qwen_video` режет видео на окна по `VISUAL_INDEXER_MAX_SCENE_SECONDS` секунд,
+   берёт из каждого окна `VISUAL_INDEXER_BATCH_SIZE` кадров, описывает окно
+   локальным Qwen2.5-VL (`VISUAL_INDEXER_MODEL`, устройство —
+   `VISUAL_INDEXER_DEVICE`; `transformers` + `torch`) отдельным запросом и
+   собирает таймлайн сцен так же, как `gemini_video`, — так длинное видео не
+   переполняет контекст модели. Настройки общие с Florence: тот же
+   `VISUAL_INDEXER_MODEL` / `VISUAL_INDEXER_DEVICE`.
+   Описания подмешиваются к
    транскрипту, поэтому ранжирование учитывает синергию слов и картинки.
    В лог ранжирования окно визуала попадает урезанным (`VISUAL_TEXT_MAX_CHARS`,
    300 символов на окно): многословные подписи Florence-2 иначе занимали почти
@@ -625,7 +634,7 @@ shorts_generator/
 ├── pipeline.py             оркестратор + публичный API
 ├── downloader.py           скачивание через yt-dlp
 ├── transcriber.py          faster-whisper (+ кэш .srt)
-├── visual_indexer.py       описание видеоряда (Florence-2 / Gemini Flash)
+├── visual_indexer.py       описание видеоряда (Florence-2 / Gemini / Qwen2.5-VL)
 ├── highlights.py           ранжирование моментов через LLM
 ├── llm.py                  бэкенды OpenAI / DeepSeek / Gemini
 ├── clipper.py              нарезка ffmpeg + вертикальный кроп OpenCV
@@ -701,7 +710,18 @@ publisher/                  публикация готовых клипов н�
   ```
   python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
   ```
-  Для `gemini` и `gemini_video` нужен `GEMINI_API_KEY`.
+  Для `gemini` и `gemini_video` нужен `GEMINI_API_KEY`. Для `qwen_video` нужны
+  `torch`, `transformers` и `qwen-vl-utils` (модель `VISUAL_INDEXER_MODEL`
+  скачивается при первом запуске). Вместо полной можно взять квантованную сборку
+  (`…-AWQ` требует пакет `autoawq`, `…-GPTQ-Int4` / `…-GPTQ-Int8` — `auto-gptq` и
+  `optimum`): она занимает заметно меньше VRAM, небольшой ценой качества описаний
+  — список вариантов с оценкой памяти в комментарии к `VISUAL_INDEXER_MODEL` в
+  `.env.example`. Qwen2.5-VL требует `transformers>=4.49`, а Florence-2 в том
+  же venv — `<4.54`, поэтому берите `transformers>=4.49,<4.54`, чтобы работали
+  оба:
+  ```
+  python -m pip install "transformers>=4.49,<4.54" torch qwen-vl-utils
+  ```
   Ставьте зависимости **в тот же интерпретатор**, которым запускается скрипт:
   если активен venv — активируйте его перед `pip install`; точный путь печатается
   в сообщении об ошибке (строка `Interpreter:`), готовую команду можно скопировать
@@ -709,14 +729,15 @@ publisher/                  публикация готовых клипов н�
   Python.
 - **Индексация визуала запущена, но не сработала** — запуск останавливается: если
   не хватает зависимостей или ключа (`florence` без `transformers`/`torch`/
-  `einops`/`timm`, `gemini*` без `GEMINI_API_KEY`) — сразу, ещё до анализа сцен, с
+  `einops`/`timm`, `gemini*` без `GEMINI_API_KEY`, `qwen_video` без
+  `transformers`/`torch`/`qwen-vl-utils`) — сразу, ещё до анализа сцен, с
   подсказкой, что установить; при любом другом сбое (таймаут API, нехватка VRAM,
   битая модель) — с
   причиной. Включённая опция либо даёт результат, либо честно останавливает запуск,
   а не игнорируется молча. Чтобы нарезать клипы без визуального контекста, выключите
   её: `VISUAL_INDEXER_ENABLED=false`.
 - **Ошибка настройки `VISUAL_INDEXER_TYPE`** — допустимы `florence`, `gemini`,
-  `gemini_video` или `none`.
+  `gemini_video`, `qwen_video` или `none`.
 - **Индекс визуала берётся из старого кэша** — результат сохраняется в
   `OUTPUT_DIR` (`<video>.visual.json`, рядом с `.srt`-кэшем транскрипта). Чтобы
   пересчитать его заново, удалите этот файл или запустите с

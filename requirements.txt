@@ -22,6 +22,12 @@ opencv-python>=4.8,<5
 #     `_supports_sdpa`, break its remote code. Verified working:
 #         pip install "transformers>=4.41,<4.54" einops timm
 #   * VISUAL_INDEXER_TYPE=gemini uses the google-genai SDK already listed above.
+#   * VISUAL_INDEXER_TYPE=qwen_video runs Qwen2.5-VL locally via transformers +
+#     torch, plus qwen-vl-utils (for process_vision_info). Qwen2.5-VL needs
+#     transformers>=4.49 while Florence-2 needs <4.54, so 'transformers>=4.41'
+#     may be too old for Qwen — use 'transformers>=4.49,<4.54' to keep both
+#     working in the same venv:
+#         pip install "transformers>=4.49,<4.54" torch qwen-vl-utils
 # transformers>=4.41,<4.54
 # einops
 # timm

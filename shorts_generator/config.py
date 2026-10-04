@@ -41,7 +41,13 @@ VALID_SUBTITLE_ANIMATIONS = ("fade", "slide", "pop")
 
 # Engines for the visual-indexing step (VISUAL_INDEXER_TYPE). "none" disables
 # it, mirroring VISUAL_INDEXER_ENABLED=false.
-VALID_VISUAL_INDEXER_TYPES = ("florence", "gemini", "gemini_video", "none")
+VALID_VISUAL_INDEXER_TYPES = (
+    "florence",
+    "gemini",
+    "gemini_video",
+    "qwen_video",
+    "none",
+)
 
 DEFAULT_TEXT_FORE_COLOR = "#FFFFFF"
 DEFAULT_STROKE_COLOR = "#000000"
