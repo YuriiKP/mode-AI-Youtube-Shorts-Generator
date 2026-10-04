@@ -59,8 +59,11 @@ __all__ = [
 # A scene window: ``(start_seconds, end_seconds)``.
 SceneSpan = Tuple[float, float]
 
-# Duration of one merged log window (seconds). Long transcript/visual spans are
-# flattened into windows of this size for the ranking log.
+# Крупность лога ранжирования, в секундах. Используется ТОЛЬКО как запасной
+# вариант, когда транскрипта нет вообще (немое видео): тогда визуальные сцены
+# раскладываются по окнам такого размера. При наличии транскрипта лог строится
+# по одной строке на реплику Whisper — с точностью до секунды, — чтобы модель
+# могла скопировать границы выбранных фраз в start_time/end_time.
 MERGE_WINDOW_SECONDS = 15.0
 
 DEFAULT_FLORENCE_MODEL = "microsoft/Florence-2-large"
@@ -102,16 +105,6 @@ VISUAL_PROMPT = (
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-
-def _format_timecode(seconds: float) -> str:
-    """Render seconds as ``MM:SS`` (or ``HH:MM:SS`` past an hour)."""
-    total = max(0, int(round(float(seconds))))
-    minutes, secs = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
 
 
 def _chunks(items: Sequence[Any], size: int) -> Iterator[List[Any]]:
@@ -912,6 +905,13 @@ def index_video(
     # VISUAL_INDEXER_ENABLED=true asked for.
     indexer.preflight()
 
+    if scenes is None:
+        print(
+            f"[visual] detecting scenes in {os.path.basename(video_path)} — "
+            "frame-by-frame scan of the whole video; on a long clip this takes "
+            "minutes, and the model is loaded only after it finishes",
+            flush=True,
+        )
     try:
         windows = (
             list(scenes)
@@ -924,6 +924,10 @@ def index_video(
         )
         if not windows:
             windows = [(0.0, _probe_duration(video_path))]
+        print(
+            f"[visual] {len(windows)} scene(s) to describe via {indexer.name}",
+            flush=True,
+        )
         result = indexer.index(windows)
     except VisualIndexerSetupError:
         # Deterministic setup problem (missing dependency / key): re-raise with
@@ -994,6 +998,49 @@ def _unique_scene_text(scenes: Sequence[Dict], start: float, end: float) -> str:
     return " ".join(seen)
 
 
+def _span_bounds(item: Dict) -> Optional[Tuple[float, float]]:
+    """``(start, end)`` айтема транскрипта/сцены или ``None``, если он пустой."""
+    try:
+        start = float(item["start"])
+        end = float(item["end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    return start, end
+
+
+def _merge_scene_windows(
+    scenes: Sequence[Dict], *, window: float
+) -> List[Dict[str, Any]]:
+    """Разложить только визуальные сцены по окнам ``window`` секунд.
+
+    Запасной путь для видео без транскрипта (немое видео): привязываться к
+    репликам не к чему, поэтому описания кадров всё равно должны дойти до
+    ранкера.
+    """
+    duration = _timeline_end([], scenes)
+    if duration <= 0:
+        return []
+    step = float(window) if window and float(window) > 0 else MERGE_WINDOW_SECONDS
+    entries: List[Dict[str, Any]] = []
+    start = 0.0
+    while start < duration - 1e-6:
+        end = min(start + step, duration)
+        visual_text = _unique_scene_text(scenes, start, end)
+        if visual_text:
+            entries.append(
+                {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "transcript": "",
+                    "visuals": visual_text,
+                }
+            )
+        start = end
+    return entries
+
+
 def merge_transcripts_and_visuals(
     transcripts: Any,
     visuals: Any,
@@ -1002,79 +1049,95 @@ def merge_transcripts_and_visuals(
 ) -> List[Dict[str, Any]]:
     """Merge Whisper segments and visual descriptions into a single log.
 
-    Both inputs share the same timeline, so the merge walks it in fixed
-    ``window``-second steps and, for every window, collects the transcript text
-    and the visual description(s) that overlap it::
+    Both inputs share the same timeline. The merge keeps the transcript's own
+    granularity — **one entry per Whisper segment** — so the ranker sees the
+    exact start and end of every phrase and can copy them straight into
+    ``start_time`` / ``end_time``::
 
-        {"start": 0.0, "end": 15.0, "transcript": "...", "visuals": "..."}
+        {"start": 12.3, "end": 15.1, "transcript": "...", "visuals": "..."}
+
+    Flattening both inputs into fixed ``window``-second buckets (the earlier
+    behaviour) threw that precision away: the model could only point at a whole
+    bucket, so its windows landed on bucket edges and dragged the surrounding
+    scenes into every clip. A visual description is attached to the first
+    segment it overlaps and kept until it changes, so a long scene caption is
+    not repeated on every line.
+
+    When there is no transcript at all, the visuals are bucketed into
+    ``window``-second entries so they still reach the ranker.
 
     Args:
         transcripts: a transcript dict (``{"segments": [...]}``) or a list of
             segment dicts (``{"start", "end", "text"}``).
         visuals: the :func:`index_video` result (``{"scenes": [...]}``) or a
             list of scene dicts (``{"start", "end", "text"}``).
-        window: length of a merged window, in seconds.
+        window: bucket length, in seconds, used only for the no-transcript
+            fallback.
 
     Returns:
-        A time-ordered list of merged windows (empty when there is nothing to
+        A time-ordered list of merged entries (empty when there is nothing to
         merge).
     """
     segments = _as_segments(transcripts)
     scenes = _as_scenes(visuals)
-    if not segments and not scenes:
-        return []
+    if not segments:
+        return _merge_scene_windows(scenes, window=window) if scenes else []
 
-    duration = _timeline_end(segments, scenes)
-    if duration <= 0:
-        return []
+    ordered = [segment for segment in segments if _span_bounds(segment) is not None]
+    ordered.sort(key=lambda segment: float(segment["start"]))
 
-    step = float(window) if window and float(window) > 0 else MERGE_WINDOW_SECONDS
     entries: List[Dict[str, Any]] = []
-    start = 0.0
-    while start < duration - 1e-6:
-        end = min(start + step, duration)
-        transcript_text = " ".join(
-            str(s.get("text", "")).strip()
-            for s in segments
-            if _overlaps(s, start, end) and str(s.get("text", "")).strip()
-        ).strip()
+    shown_visual: Optional[str] = None
+    for segment in ordered:
+        bounds = _span_bounds(segment)
+        if bounds is None:
+            continue
+        start, end = bounds
+        transcript_text = str(segment.get("text", "")).strip()
         visual_text = _unique_scene_text(scenes, start, end)
-        if transcript_text or visual_text:
-            entries.append(
-                {
-                    "start": round(start, 3),
-                    "end": round(end, 3),
-                    "transcript": transcript_text,
-                    "visuals": visual_text,
-                }
-            )
-        start = end
+        new_visual = ""
+        if visual_text and visual_text != shown_visual:
+            new_visual = visual_text
+            shown_visual = visual_text
+        if not transcript_text and not new_visual:
+            continue
+        entries.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "transcript": transcript_text,
+                "visuals": new_visual,
+            }
+        )
     return entries
 
 
 def format_merged_log(entries: Sequence[Dict[str, Any]]) -> str:
-    """Render merged windows as the ranker's log lines.
+    """Render merged entries as the ranker's log lines.
 
-    Each line is ``[Time: MM:SS - MM:SS] Transcript: "...", Visuals: "..."``.
+    Each line carries the phrase's own second-precision window —
+    ``[12.30 - 15.10] реплика`` — plus, when a scene description changes, a
+    ``[Visuals: "..."]`` note. Seconds keep two decimals on purpose: the model
+    can copy the exact start of the hook phrase and the exact end of the
+    punchline phrase into ``start_time`` / ``end_time`` instead of rounding to a
+    coarse window and swallowing the neighbouring scenes.
     """
     lines: List[str] = []
     for entry in entries:
-        head = (
-            f"[Time: {_format_timecode(entry.get('start', 0))} - "
-            f"{_format_timecode(entry.get('end', 0))}]"
-        )
-        body: List[str] = []
+        start, end = _span_bounds(entry) or (0.0, 0.0)
+        head = f"[{start:.2f} - {end:.2f}]"
+        parts: List[str] = []
         transcript = str(entry.get("transcript", "") or "").strip()
-        visual = str(entry.get("visuals", "") or "").strip()
         if transcript:
-            body.append(f'Transcript: "{transcript}"')
+            parts.append(transcript)
+        visual = str(entry.get("visuals", "") or "").strip()
         if visual:
             # Длинное описание кадра — шум для ранкера: обрезаем окно, чтобы
             # речь не тонула в простыне визуального текста.
             if len(visual) > VISUAL_TEXT_MAX_CHARS:
                 visual = visual[:VISUAL_TEXT_MAX_CHARS].rstrip() + "…"
-            body.append(f'Visuals: "{visual}"')
-        lines.append(head if not body else f"{head} " + ", ".join(body))
+            parts.append(f'[Visuals: "{visual}"]')
+        lines.append(f"{head} {' '.join(parts)}".rstrip())
     return "\n".join(lines)
 
 

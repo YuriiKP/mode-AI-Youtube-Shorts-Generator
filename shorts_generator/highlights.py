@@ -108,6 +108,8 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 Твоя задача: определить самые виральные моменты (хайлайты) в логе видео.
 
 Правила:
+- В логе КАЖДАЯ реплика помечена своим интервалом [начало - конец] в секундах. Значения start_time и end_time бери РОВНО из границ выбранных реплик: start_time — начало реплики-хука, end_time — конец реплики-панчлайна. Не округляй до соседних строк и не бери окно целиком.
+- В окно клипа должны попасть ТОЛЬКО реплики от хука до панчлайна. Не захватывай реплику ПЕРЕД хуком и реплику ПОСЛЕ панчлайна — именно из-за них в клип залезают соседние сцены.
 - Начинай клип ровно на хуке и заканчивай ровно на панчлайне. Не тяни разгон, контекст и продолжение «на всякий случай».
 - Предпочтительная длительность: 20–50 секунд. Идеальный одиночный one-liner может быть короче; развёрнутая история — до 60 секунд.
 - Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным.
@@ -283,9 +285,13 @@ def _has_visuals(visuals: Optional[Dict]) -> bool:
 def build_transcript_log(transcript: Dict, visuals: Optional[Dict] = None) -> str:
     """Build the ranking log, enriched with visual context when available.
 
-    Without visuals this is the plain transcript log. With visuals the merge
-    produces windowed lines like
-    [Time: 00:00 - 00:15] Transcript: "...", Visuals: "...".
+    Both paths keep the transcript's own granularity — one line per phrase,
+    tagged with its exact ``[start - end]`` seconds — so the model can copy
+    precise clip boundaries. Without visuals it is the plain transcript log;
+    with visuals the merge adds a ``[Visuals: "..."]`` note to the phrases a
+    described scene overlaps. (The earlier fixed 15-second windows hid the
+    phrase boundaries and made the model cut whole windows, dragging in the
+    neighbouring scenes.)
     """
     if _has_visuals(visuals):
         entries = merge_transcripts_and_visuals(transcript.get("segments", []), visuals)
@@ -295,8 +301,24 @@ def build_transcript_log(transcript: Dict, visuals: Optional[Dict] = None) -> st
 
 
 def build_transcript_text(transcript: Dict) -> str:
-    segments = transcript.get("segments", [])
-    return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    """Render the transcript as one line per phrase with exact seconds.
+
+    Each line is ``[start - end] текст`` (two decimals), so the ranker sees
+    where every phrase begins *and* ends and can copy those exact boundaries into
+    ``start_time`` / ``end_time``. The old ``[12.3s] текст`` form only showed the
+    start, so the model had to guess the phrase end — and usually overshot into
+    the neighbouring phrase.
+    """
+    lines: List[str] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(segment.get("text", "")).strip()
+        lines.append(f"[{start:.2f} - {end:.2f}] {text}".rstrip())
+    return "\n".join(lines)
 
 
 def chunk_transcript(transcript: Dict, visuals: Optional[Dict] = None) -> List[Dict]:
@@ -375,12 +397,11 @@ def call_highlight_api(
         )
     if has_visuals:
         visual_hint = (
-            "В логе для каждого таймкода два поля: transcript — что говорит "
-            "спикер, и Visuals (visual_context) — что в этот момент происходит "
-            "на экране. Оценивай синергию: момент, где слова подкрепляются "
-            "ярким визуальным действием (эмоция, смех, фейл, необычный объект, "
-            "графика), ценнее. Хук может быть и визуальным — резкое действие "
-            "в кадре."
+            'В логе у части реплик после текста стоит пометка [Visuals: "…"] — '
+            "что происходит на экране в эти секунды. Оценивай синергию: момент, "
+            "где слова подкрепляются ярким визуальным действием (эмоция, смех, "
+            "фейл, необычный объект, графика), ценнее. Хук может быть и "
+            "визуальным — резкое действие в кадре."
         )
     else:
         visual_hint = ""
