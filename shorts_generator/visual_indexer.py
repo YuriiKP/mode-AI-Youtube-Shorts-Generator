@@ -493,6 +493,100 @@ def _gemini_dependency_message(engine: str, exc: ImportError) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Provider error classification
+#
+# Shared by the cloud engines so a permanent API error (a retired model name, a
+# rejected key, a malformed request) is reported at once instead of being
+# retried through the whole backoff — which is what hid a 404 "model no longer
+# available" behind a "gave up" line and let the run continue without visuals.
+# ---------------------------------------------------------------------------
+
+# HTTP statuses worth retrying: request timeout, conflict and "too many
+# requests". Any other 4xx is permanent; 5xx is transient overload.
+_RETRYABLE_HTTP_STATUS = frozenset({408, 409, 429})
+
+# Message-level fallback for SDKs that expose no usable status code.
+_RETRYABLE_ERROR_MARKERS = (
+    "resource_exhausted",
+    "resource exhausted",
+    "unavailable",
+    "overloaded",
+    "high demand",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "timed out",
+    "timeout",
+    "deadline",
+    "temporarily",
+    "try again",
+)
+
+# The "404 NOT_FOUND." / "503 UNAVAILABLE." prefix google-genai puts in str(exc).
+_STATUS_IN_MESSAGE_RE = re.compile(r"\b([1-5]\d{2})\b\s+[A-Z][A-Z_]{2,}")
+
+
+def _provider_http_status(exc: Exception) -> Optional[int]:
+    """Best-effort HTTP status behind a provider exception, else ``None``.
+
+    ``google-genai`` (and google-api-core) expose it as ``.code``; some SDKs use
+    ``.status_code``. When neither is set the ``"404 NOT_FOUND. …"`` prefix of
+    the message is parsed as a last resort.
+    """
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            if 100 <= value <= 599:
+                return value
+            continue
+        match = re.search(r"\b([1-5]\d{2})\b", str(value))
+        if match:
+            return int(match.group(1))
+    match = _STATUS_IN_MESSAGE_RE.search(str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    """True only for errors a second attempt can plausibly fix.
+
+    4xx other than 408/409/429 (a retired model name, a bad key, a malformed
+    request) are permanent: they are surfaced immediately instead of being
+    retried, so the real cause is not masked as a transient network blip.
+    """
+    status = _provider_http_status(exc)
+    if status is not None:
+        return status in _RETRYABLE_HTTP_STATUS or status >= 500
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
+
+
+def _non_retryable_error(engine: str, model: str, exc: Exception) -> RuntimeError:
+    """Turn a permanent provider error into a clear, actionable ``RuntimeError``."""
+    status = _provider_http_status(exc)
+    what = f"HTTP {status}" if status is not None else "non-retryable error"
+    message = f"{engine} request failed with a {what} that retrying cannot fix: {exc}"
+    text = str(exc).lower()
+    if status in (401, 403) or "api key" in text or "permission" in text:
+        message += (
+            "\nCheck GEMINI_API_KEY in .env — the key looks rejected or lacks "
+            "access to this API."
+        )
+    elif status == 404 or "not found" in text or "no longer available" in text:
+        message += (
+            f"\nThe model {model!r} (GEMINI_MODEL in .env) is not available to "
+            "this key — it may be retired or renamed. Update GEMINI_MODEL and "
+            "re-run."
+        )
+    elif status == 400:
+        message += (
+            f"\nThe request was rejected as malformed; check GEMINI_MODEL ({model!r})."
+        )
+    return RuntimeError(message)
+
+
+# ---------------------------------------------------------------------------
 # Strategy: base engine
 # ---------------------------------------------------------------------------
 
@@ -775,6 +869,7 @@ class GeminiFlashIndexer(BaseVisualIndexer):
         )
         contents = [prompt, *[image for _, image, _ in prepared]]
 
+        last_error: Any = None
         for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
             try:
                 response = client.models.generate_content(
@@ -788,6 +883,12 @@ class GeminiFlashIndexer(BaseVisualIndexer):
                 )
                 return self._map_response(response.text or "", prepared)
             except Exception as exc:  # noqa: BLE001 - network / timeout / quota
+                last_error = exc
+                # A permanent error (retired model name, rejected key, malformed
+                # request) fails identically on every attempt: stop now with the
+                # real cause instead of hiding it behind the backoff.
+                if not _is_retryable_provider_error(exc):
+                    raise _non_retryable_error("Gemini", model, exc) from exc
                 print(
                     f"[visual] gemini request failed "
                     f"({type(exc).__name__}: {exc}) "
@@ -797,16 +898,13 @@ class GeminiFlashIndexer(BaseVisualIndexer):
                 if attempt < GEMINI_MAX_ATTEMPTS:
                     time.sleep(GEMINI_RETRY_BACKOFF * attempt)
 
-        # All attempts failed: keep the timecodes with empty descriptions so the
-        # merge still lines up, and let ranking continue without visuals.
-        return [
-            {
-                "start": round(float(scene[0]), 3),
-                "end": round(float(scene[1]), 3),
-                "text": "",
-            }
-            for scene, _, _ in prepared
-        ]
+        # Transient errors exhausted every attempt: surface them instead of
+        # returning empty descriptions, so an enabled indexer either contributes
+        # or stops the run (index_video adds the fix-it hint).
+        raise RuntimeError(
+            f"Gemini request failed after {GEMINI_MAX_ATTEMPTS} attempt(s) "
+            f"({type(last_error).__name__}: {last_error})"
+        ) from last_error
 
     def _map_response(self, raw: str, prepared) -> List[Dict[str, Any]]:
         texts: Dict[int, str] = {}
@@ -1405,6 +1503,11 @@ class GeminiVideoIndexer(BaseVisualIndexer):
                 return self._parse_timeline(response.text or "", duration)
             except Exception as exc:  # noqa: BLE001 - network / timeout / quota
                 last_error = exc
+                # A permanent error (retired model name, rejected key, malformed
+                # request) fails identically on every attempt: stop now with the
+                # real cause instead of hiding it behind the backoff.
+                if not _is_retryable_provider_error(exc):
+                    raise _non_retryable_error("Gemini video", model, exc) from exc
                 print(
                     f"[visual] gemini video request failed "
                     f"({type(exc).__name__}: {exc}) "
@@ -1414,8 +1517,13 @@ class GeminiVideoIndexer(BaseVisualIndexer):
                 if attempt < attempts:
                     time.sleep(backoff * (2 ** (attempt - 1)))
 
-        print(f"[visual] gemini video gave up: {last_error}", flush=True)
-        return []
+        # Transient errors exhausted every attempt: surface them instead of
+        # returning an empty index, so an enabled indexer either contributes or
+        # stops the run (index_video adds the fix-it hint).
+        raise RuntimeError(
+            f"Gemini video request failed after {attempts} attempt(s) "
+            f"({type(last_error).__name__}: {last_error})"
+        ) from last_error
 
     def _parse_timeline(self, raw: str, duration: float) -> List[Dict[str, Any]]:
         data: Any = None
