@@ -25,7 +25,6 @@ pipeline keeps working when visual indexing is switched off.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import math
 import os
@@ -34,7 +33,6 @@ import shutil
 import sys
 import tempfile
 import time
-import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -341,14 +339,6 @@ def _ascii_upload_path(video_path: str):
     temp_path = os.path.join(temp_dir, "video" + ext)
     shutil.copyfile(video_path, temp_path)
     return temp_path, temp_dir
-
-
-@contextlib.contextmanager
-def _silence_afc_warning():
-    """Hide the noisy google-genai "automatic function calling" notice."""
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r".*automatic function calling.*")
-        yield
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +869,10 @@ class GeminiFlashIndexer(BaseVisualIndexer):
                         "temperature": 0.2,
                         "response_mime_type": "application/json",
                         "max_output_tokens": 2048,
+                        # No tools/callables are passed, so automatic function
+                        # calling (AFC) has nothing to run; disabling it makes
+                        # the SDK take the plain generate_content path.
+                        "automatic_function_calling": {"disable": True},
                     },
                 )
                 return self._map_response(response.text or "", prepared)
@@ -1490,16 +1484,20 @@ class GeminiVideoIndexer(BaseVisualIndexer):
         last_error: Any = None
         for attempt in range(1, attempts + 1):
             try:
-                with _silence_afc_warning():
-                    response = client.models.generate_content(
-                        model=model,
-                        contents=[video_file, prompt],
-                        config={
-                            "temperature": 0.2,
-                            "response_mime_type": "application/json",
-                            "max_output_tokens": 8192,
-                        },
-                    )
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[video_file, prompt],
+                    config={
+                        "temperature": 0.2,
+                        "response_mime_type": "application/json",
+                        "max_output_tokens": 8192,
+                        # No tools/callables are passed, so automatic function
+                        # calling (AFC) has nothing to run. Disabling it makes
+                        # the SDK take the plain generate_content path — no AFC
+                        # loop and no "direct use of AFC is not recommended" log.
+                        "automatic_function_calling": {"disable": True},
+                    },
+                )
                 return self._parse_timeline(response.text or "", duration)
             except Exception as exc:  # noqa: BLE001 - network / timeout / quota
                 last_error = exc

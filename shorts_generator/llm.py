@@ -8,7 +8,6 @@ the single ``.env`` file.
 from __future__ import annotations
 
 import time
-import warnings
 
 from .config import (
     Settings,
@@ -22,12 +21,24 @@ LLM_MAX_ATTEMPTS = 5
 LLM_RETRY_BACKOFF = 2.0
 
 _RETRYABLE_MARKERS = (
-    "429", "500", "502", "503", "504",
-    "resource_exhausted", "resource exhausted",
-    "unavailable", "overloaded", "high demand",
-    "rate limit", "rate_limit", "too many requests",
-    "timed out", "timeout", "deadline",
-    "temporarily", "try again",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "resource_exhausted",
+    "resource exhausted",
+    "unavailable",
+    "overloaded",
+    "high demand",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "timed out",
+    "timeout",
+    "deadline",
+    "temporarily",
+    "try again",
 )
 
 
@@ -40,7 +51,9 @@ def _is_retryable(exc: Exception) -> bool:
 def _call_with_retries(call, settings: Settings):
     """Вызвать ``call()``, повторяя временные ошибки с экспоненциальным бэкоффом."""
     attempts = max(1, int(getattr(settings, "llm_max_attempts", 0) or LLM_MAX_ATTEMPTS))
-    backoff = abs(float(getattr(settings, "llm_retry_backoff", LLM_RETRY_BACKOFF) or 0.0))
+    backoff = abs(
+        float(getattr(settings, "llm_retry_backoff", LLM_RETRY_BACKOFF) or 0.0)
+    )
     for attempt in range(1, attempts + 1):
         try:
             return call()
@@ -98,6 +111,7 @@ def call_deepseek_llm(prompt: str, settings: Settings) -> str:
         api_key=require_deepseek_key(settings),
         base_url=settings.deepseek_base_url,
     )
+
     def _create(**extra):
         return _call_with_retries(
             lambda: client.chat.completions.create(
@@ -129,22 +143,23 @@ def call_gemini_llm(prompt: str, settings: Settings) -> str:
         ) from e
 
     client = genai.Client(api_key=require_gemini_key(settings))
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", message=r".*automatic function calling.*"
-        )
-        response = _call_with_retries(
-            lambda: client.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config={
-                    "temperature": 0.2,
-                    "response_mime_type": "application/json",
-                    "max_output_tokens": 8192,
-                },
-            ),
-            settings,
-        )
+    response = _call_with_retries(
+        lambda: client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config={
+                "temperature": 0.2,
+                "response_mime_type": "application/json",
+                "max_output_tokens": 8192,
+                # We pass no tools/callables, so automatic function calling
+                # (AFC) has nothing to run. Disabling it explicitly makes the
+                # SDK take the plain generate_content path — no AFC loop and no
+                # "direct use of AFC is not recommended" log line.
+                "automatic_function_calling": {"disable": True},
+            },
+        ),
+        settings,
+    )
     return response.text or ""
 
 
