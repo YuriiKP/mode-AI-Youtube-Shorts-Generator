@@ -21,6 +21,7 @@ from .downloader import download_youtube
 from .enhance import enhance_shorts
 from .highlights import (
     dedupe_highlights,
+    enrich_highlights_metadata,
     get_highlights,
     select_highlights,
     snap_highlights_to_transcript,
@@ -162,6 +163,18 @@ def _process_one(
         f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates",
         flush=True,
     )
+
+    # Двухэтапный режим: ранжирование отдало только тайминги, оценку и причину,
+    # а метаданные (заголовок, описание, теги, метрики) генерируются здесь —
+    # одним батч-вызовом и только для клипов, которые реально пойдут в нарезку.
+    # Хук и панчлайн этап 2 выводит из финального окна детерминированно.
+    if settings.two_stage_analysis:
+        with timer.stage("metadata"):
+            enrich_highlights_metadata(top, transcript, settings)
+        print(
+            f"[pipeline] metadata generated for {len(top)} selected clip(s)",
+            flush=True,
+        )
 
     # Analysis log: show what was actually selected for cutting — each clip's
     # time window plus a few words from its start and end phrases.

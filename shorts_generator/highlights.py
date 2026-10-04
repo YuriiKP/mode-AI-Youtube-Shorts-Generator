@@ -52,15 +52,66 @@ HIGHLIGHT_SYSTEM_PROMPT = """
 {visual_hint}
 
 ПРАВИЛА НАРЕЗКИ:
-1. Длительность: 20–60 секунд. Игнорируй микро-моменты короче 15 секунд. Если логика сцены требует 60 секунд для полного раскрытия контекста — бери весь фрагмент.
+1. Длительность: 50–90 секунд.
 2. Границы клипа: Начинай ровно с хука и заканчивай чётким панчлайном. Бери точные значения start_time и end_time из лога [начало - конец].
 3. Изолированность: Хайлайты не должны пересекаться и не должны стоять впритык друг к другу. Выбирай только лучшие моменты с паузами между ними.
 4. Оценка 0-100 по виральному потенциалу.
 5. {num_clips_instruction}
 
 Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений) со строгим соблюдением структуры:
-{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","title":"string","description":"string","tags":["string"],"start_time":float,"end_time":float,"score":int,"laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string","virality_reason":"string"}}]}}
-"""
+{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","title":"string","description":"string","tags":["string"],"start_time":float,"end_time":float,"score":int,"laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string","virality_reason":"string"}}]}}"""
+
+
+# --- Двухэтапная генерация (TWO_STAGE_ANALYSIS) --------------------------
+# Этап 1: только тайминги, оценка и причина. Метаданные (заголовок, описание,
+# теги, метрики) здесь не запрашиваются — вывод короче, attention модели не
+# распылён между «математикой» границ и креативом, а риск обрезать JSON падает.
+TIMING_SYSTEM_PROMPT = """Ты элитный редактор коротких вертикальных видео, изучивший тысячи вирусных клипов в TikTok, Instagram Reels и YouTube Shorts. Ты точно знаешь, что заставляет зрителей прекратить листать, досматривать до конца и делиться.
+
+{virality_criteria}
+
+{content_hint}
+
+{visual_hint}
+
+Твоя задача: определить самые виральные моменты (хайлайты) в логе видео и указать ТОЛЬКО их точные границы и оценку. Никаких заголовков, описаний и хэштегов здесь не нужно — это отдельный шаг.
+
+Правила:
+- В логе КАЖДАЯ реплика помечена своим интервалом [начало - конец] в секундах. Значения start_time и end_time бери РОВНО из границ выбранных реплик: start_time — начало реплики-хука, end_time — конец реплики-панчлайна. Не округляй до соседних строк и не бери окно целиком.
+- В окно клипа должны попасть ТОЛЬКО реплики от хука до панчлайна. Не захватывай реплику ПЕРЕД хуком и реплику ПОСЛЕ панчлайна — именно из-за них в клип залезают соседние сцены.
+- Начинай клип ровно на хуке и заканчивай ровно на панчлайне. Не тяни разгон, контекст и продолжение «на всякий случай».
+- Предпочтительная длительность: 50–90 секунд.
+- Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным.
+- Клипы не должны существенно пересекаться друг с другом.
+- Бесшовность (Loop): по возможности выводи финал обратно к началу.
+- Оценка 0-100 по виральному потенциалу (а не по общему качеству).
+- {num_clips_instruction}
+- Укажи "clip_type" — короткий тип момента (например: shock, conflict, reveal, joke, emotional).
+- Объясни одним предложением, почему этот клип виральный ("virality_reason").
+
+Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
+{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","start_time":float,"end_time":float,"score":int,"virality_reason":"string"}}]}}"""
+
+
+# Этап 2: метаданные по уже вырезанным фрагментам. Модель не видит всё видео —
+# только текст каждого отобранного клипа и причину его виральности, поэтому её
+# задача сужена до упаковки. Возвращает массив с номером фрагмента ("index").
+METADATA_SYSTEM_PROMPT = """Ты элитный SMM-редактор YouTube Shorts, TikTok и Instagram Reels. Ты упаковываешь уже готовые фрагменты видео в публикацию: цепляющий заголовок, короткое описание, хэштеги и метрики вовлечения.
+
+Тебе передают несколько готовых фрагментов. Каждый помечен «#N» и содержит текст речи внутри фрагмента и краткую причину, почему он виральный. Разбирай КАЖДЫЙ фрагмент отдельно и только по его содержимому.
+
+Для каждого фрагмента верни:
+- "title" — кликбейтный цепляющий заголовок до 60 символов, без кавычек, хэштегов и markdown. Пиши на языке фрагмента.
+- "description" — короткое цепляющее описание на 1-2 предложения для подписи к видео, без хэштегов, эмодзи и markdown.
+- "tags" — массив из 3–5 коротких хэштегов (без символа #), точно по теме фрагмента. Пиши теги латиницей, при необходимости добавь тег на языке контента. Пример: ["anime","shorts","аниме"].
+- "laugh_score", "cringe_score", "intrigue_score" — от 0 до 5: силы юмора, «испанского стыда» и интриги в этом фрагменте.
+- "clip_type" — короткий тип момента (например: shock, conflict, reveal, joke, emotional).
+- "index" — номер фрагмента из запроса, для которого эти метаданные (1, 2, 3, ...). Обязательно.
+- "hook_sentence" — точная первая фраза фрагмента, которая заставляет остановиться (бери из текста фрагмента).
+- "punchline" — точная последняя фраза-развязка фрагмента (бери из текста фрагмента).
+
+Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
+{{"clips":[{{"index":int,"title":"string","description":"string","tags":["string"],"clip_type":"string","laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200  # 20-min chunks for long videos
@@ -300,20 +351,17 @@ def chunk_transcript(transcript: Dict, visuals: Optional[Dict] = None) -> List[D
     return chunks
 
 
-def call_highlight_api(
-    transcript_text: str,
+def _prompt_hints(
     content_info: Optional[Dict],
-    duration: float,
-    num_clips: int,
-    llm_fn: LLMFn,
-    is_chunk: bool = False,
-    has_visuals: bool = False,
-) -> Dict:
-    # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
-    # doesn't have to generate a huge JSON payload (which can time out the model).
-    target = max(num_clips * 2, 5)
-    natural_max = max(2 if is_chunk else 3, int(duration / 90))
-    min_clips = min(target, natural_max, 8)
+    has_visuals: bool,
+    min_clips: int,
+) -> Tuple[str, str, str]:
+    """Build the shared ``content_hint`` / ``visual_hint`` / clip-count text.
+
+    Shared by the single-stage prompt and the two-stage timing prompt, so both
+    see exactly the same context and differ only in what they are asked to emit.
+    Extracted so the two modes cannot drift apart.
+    """
     known = content_info or {}
     known_type = known.get("content_type")
     known_density = known.get("density")
@@ -339,15 +387,43 @@ def call_highlight_api(
         )
     else:
         visual_hint = ""
-    system = HIGHLIGHT_SYSTEM_PROMPT.format(
+    num_clips_instruction = (
+        f"Верни НЕ БОЛЬШЕ {min_clips} клипов, лучшие — первыми. "
+        f"Можно вернуть меньше — качество важнее количества. "
+        f"Никогда не добивай список слабыми моментами."
+    )
+    return content_hint, visual_hint, num_clips_instruction
+
+
+def call_highlight_api(
+    transcript_text: str,
+    content_info: Optional[Dict],
+    duration: float,
+    num_clips: int,
+    llm_fn: LLMFn,
+    is_chunk: bool = False,
+    has_visuals: bool = False,
+    two_stage: bool = False,
+) -> Dict:
+    # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
+    # doesn't have to generate a huge JSON payload (which can time out the model).
+    target = max(num_clips * 2, 5)
+    natural_max = max(2 if is_chunk else 3, int(duration / 90))
+    min_clips = min(target, natural_max, 8)
+    known = content_info or {}
+    known_type = known.get("content_type")
+    known_density = known.get("density")
+    content_hint, visual_hint, num_clips_instruction = _prompt_hints(
+        content_info, has_visuals, min_clips
+    )
+    # Two-stage asks only for timing/score/reason here; the single-stage prompt
+    # still emits the full payload (title/tags/etc.) in one pass.
+    template = TIMING_SYSTEM_PROMPT if two_stage else HIGHLIGHT_SYSTEM_PROMPT
+    system = template.format(
         virality_criteria=VIRALITY_CRITERIA,
         content_hint=content_hint,
         visual_hint=visual_hint,
-        num_clips_instruction=(
-            f"Верни НЕ БОЛЬШЕ {min_clips} клипов, лучшие — первыми. "
-            f"Можно вернуть меньше — качество важнее количества. "
-            f"Никогда не добивай список слабыми моментами."
-        ),
+        num_clips_instruction=num_clips_instruction,
     )
     base_prompt = f"{system}\n\nТранскрипт:\n{transcript_text}"
     prompt = base_prompt
@@ -384,17 +460,201 @@ def call_highlight_api(
         )
 
         if attempt < MAX_HIGHLIGHT_API_ATTEMPTS:
+            fields = (
+                "clip_type, start_time, end_time, score, virality_reason"
+                if two_stage
+                else "clip_type, title, description, tags (массив коротких хэштегов без #),"
+                " start_time, end_time, score, laugh_score, cringe_score, intrigue_score,"
+                " hook_sentence, punchline, virality_reason"
+            )
             prompt = (
                 base_prompt
                 + "\n\nВАЖНО: верни ТОЛЬКО валидный JSON: на верхнем уровне поля content_type, density и массив 'highlights'."
-                + " Каждый элемент обязан содержать: clip_type, title, description, tags (массив коротких хэштегов без #),"
-                + " start_time, end_time, score, laugh_score, cringe_score, intrigue_score, hook_sentence, punchline, virality_reason."
+                + f" Каждый элемент обязан содержать: {fields}."
                 + " Без markdown-ограждений, без комментариев."
             )
 
     raise RuntimeError(
         f"Highlight generator produced invalid output after {MAX_HIGHLIGHT_API_ATTEMPTS} attempts: {last_error}"
     )
+
+
+def build_clip_text(transcript: Dict, start: float, end: float) -> str:
+    """Текст речи внутри окна ``[start, end]`` — вход для этапа метаданных.
+
+    Собирает реплики транскрипта, перекрывающие окно, в одну строку. Это ровно
+    тот текст, который попадёт в вырезанный клип, поэтому метаданные этапа 2
+    описывают именно его, а не окно до привязки к фразам.
+    """
+    parts: List[str] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            seg_start = float(segment["start"])
+            seg_end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seg_end <= start or seg_start >= end:
+            continue
+        text = str(segment.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def derive_hook_punchline(
+    transcript: Dict, start: float, end: float
+) -> Tuple[str, str]:
+    """Хук и панчлайн окна: первая и последняя реплики внутри границ.
+
+    Границы клипа уже привязаны к целым фразам, поэтому хук — это первая
+    реплика окна, а панчлайн — последняя. Раньше оба поля просили у модели до
+    сдвига границ, и они могли разойтись с реально вырезанным фрагментом; здесь
+    они выводятся из финального окна и всегда ему соответствуют.
+    """
+    first, last = "", ""
+    for segment in transcript.get("segments", []) or []:
+        try:
+            seg_start = float(segment["start"])
+            seg_end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seg_end <= start or seg_start >= end:
+            continue
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        if not first:
+            first = text
+        last = text
+    return first, last
+
+
+def _build_metadata_prompt(fragments: List[Tuple[int, str, str]]) -> str:
+    """Собрать промпт этапа 2 из ``(index, text, virality_reason)``."""
+    blocks: List[str] = []
+    for index, text, reason in fragments:
+        block = f"#{index}\nФрагмент: {text or '(без речи)'}"
+        if reason:
+            block += f"\nПочему виральный: {reason}"
+        blocks.append(block)
+    body = "\n\n".join(blocks)
+    return f"{METADATA_SYSTEM_PROMPT}\n\nФрагменты:\n{body}"
+
+
+def enrich_highlights_metadata(
+    clips: List[Dict],
+    transcript: Dict,
+    settings: Settings,
+    *,
+    llm_fn: Optional[LLMFn] = None,
+) -> List[Dict]:
+    """Этап 2: заполнить заголовок, описание, теги и метрики финальных клипов.
+
+    Один батч-вызов на все клипы (а не вызов на клип), поэтому суммарная
+    стоимость — два запроса на видео: ранжирование и упаковка. Метаданные
+    генерируются только для уже отобранных клипов, а не для всех кандидатов,
+    как в одноэтапном режиме. Хук и панчлайн модель задаёт по тексту фрагмента;
+    если она их не вернула, они выводятся детерминированно из финального окна.
+    При любой ошибке клипы остаются со
+    значениями по умолчанию — публикация не ломается.
+    """
+    if not clips:
+        return clips
+
+    for clip in clips:
+        try:
+            start = float(clip.get("start_time", 0.0))
+            end = float(clip.get("end_time", 0.0))
+        except (TypeError, ValueError):
+            continue
+        hook, punchline = derive_hook_punchline(transcript, start, end)
+        if not clip.get("hook_sentence"):
+            clip["hook_sentence"] = hook
+        if not clip.get("punchline"):
+            clip["punchline"] = punchline
+
+    fragments: List[Tuple[int, str, str]] = []
+    for index, clip in enumerate(clips, 1):
+        try:
+            start = float(clip["start_time"])
+            end = float(clip["end_time"])
+        except (KeyError, TypeError, ValueError):
+            start = end = 0.0
+        fragments.append(
+            (
+                index,
+                build_clip_text(transcript, start, end),
+                str(clip.get("virality_reason") or "").strip(),
+            )
+        )
+
+    prompt = _build_metadata_prompt(fragments)
+    call = llm_fn or (lambda p: call_llm(p, settings))
+    try:
+        parsed = _parse_json_loose(call(prompt))
+    except Exception as exc:  # noqa: BLE001 - metadata is best-effort
+        print(
+            f"[highlights] stage-2 metadata failed "
+            f"({type(exc).__name__}: {exc}); keeping defaults",
+            flush=True,
+        )
+        return clips
+
+    items = parsed.get("clips") if isinstance(parsed, dict) else parsed
+    if not isinstance(items, list):
+        print(
+            "[highlights] stage-2 metadata: unexpected response shape; keeping defaults",
+            flush=True,
+        )
+        return clips
+
+    by_index: Dict[int, Dict] = {}
+    for item in items:
+        if isinstance(item, dict):
+            by_index[_coerce_int(item.get("index"), default=-1)] = item
+
+    for index, clip in enumerate(clips, 1):
+        item = by_index.get(index)
+        # Fallback: if the model dropped "index" but kept the array order, map
+        # positionally — only when the counts line up, to avoid a misfit.
+        if (
+            item is None
+            and len(items) == len(clips)
+            and isinstance(items[index - 1], dict)
+        ):
+            item = items[index - 1]
+        if item is None:
+            continue
+        title = str(item.get("title") or "").strip()
+        if title:
+            clip["title"] = title
+        description = str(item.get("description") or "").strip()
+        if description:
+            clip["description"] = description
+        tags = _normalize_tags(item.get("tags"))
+        if tags:
+            clip["tags"] = tags
+        clip_type = str(item.get("clip_type") or "").strip().lower()
+        if clip_type:
+            clip["clip_type"] = clip_type
+        hook = str(item.get("hook_sentence") or "").strip()
+        if hook:
+            clip["hook_sentence"] = hook
+        punchline = str(item.get("punchline") or "").strip()
+        if punchline:
+            clip["punchline"] = punchline
+        for key in ("laugh_score", "cringe_score", "intrigue_score"):
+            if item.get(key) is not None:
+                clip[key] = max(
+                    0,
+                    min(
+                        5,
+                        _coerce_int(
+                            item.get(key), default=_coerce_int(clip.get(key), 0)
+                        ),
+                    ),
+                )
+    return clips
 
 
 def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
@@ -803,11 +1063,20 @@ def get_highlights(
     settings: Settings,
     num_clips: int = 3,
     visuals: Optional[Dict] = None,
+    two_stage: Optional[bool] = None,
 ) -> Dict:
     """Main entry point — returns ``{highlights: [...]}`` sorted by score.
 
     The LLM provider and model come from ``settings`` (the single ``.env``).
+
+    When ``two_stage`` is true (default: ``settings.two_stage_analysis``) the
+    ranking asks the model only for timing/score/reason; the metadata fields are
+    left at their defaults here and filled later by
+    :func:`enrich_highlights_metadata` for the clips that actually survive
+    selection. This keeps the ranking call short and its JSON small.
     """
+    if two_stage is None:
+        two_stage = bool(settings.two_stage_analysis)
     llm_fn: LLMFn = lambda prompt: call_llm(prompt, settings)  # noqa: E731
 
     duration = transcript.get("duration", 0)
@@ -841,6 +1110,7 @@ def get_highlights(
                 llm_fn=llm_fn,
                 is_chunk=True,
                 has_visuals=_has_visuals(chunk.get("_visuals")),
+                two_stage=two_stage,
             )
             if content_info is None:
                 content_info = {
@@ -865,6 +1135,7 @@ def get_highlights(
             num_clips=num_clips,
             llm_fn=llm_fn,
             has_visuals=_has_visuals(visuals),
+            two_stage=two_stage,
         )
         print(
             f"[highlights] content={result.get('content_type')} density={result.get('density')} duration={duration:.0f}s",
