@@ -85,6 +85,7 @@ def _reframe_vertical(
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
         import cv2  # type: ignore
+        import numpy as np  # type: ignore
     except ImportError as e:
         raise RuntimeError(
             "opencv-python is required. Install it with:\n"
@@ -168,48 +169,59 @@ def _reframe_vertical(
     frame_index = 0
     last_center: Optional[Tuple[int, int]] = None
     smoothing = 0.15  # how aggressively to chase a new face position
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if face_cascade is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
-            )
-            if len(faces) > 0:
-                # Pick the largest face — usually the speaker.
-                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                cx = x + w // 2
-                cy = y + h // 2
-                if last_center is None:
-                    last_center = (cx, cy)
-                else:
-                    lx, ly = last_center
-                    last_center = (
-                        int(lx + (cx - lx) * smoothing),
-                        int(ly + (cy - ly) * smoothing),
-                    )
-        if last_center is None:
-            last_center = (src_w // 2, src_h // 2)
+            if face_cascade is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40)
+                )
+                if len(faces) > 0:
+                    # Pick the largest face — usually the speaker.
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    cx = x + w // 2
+                    cy = y + h // 2
+                    if last_center is None:
+                        last_center = (cx, cy)
+                    else:
+                        lx, ly = last_center
+                        last_center = (
+                            int(lx + (cx - lx) * smoothing),
+                            int(ly + (cy - ly) * smoothing),
+                        )
+            if last_center is None:
+                last_center = (src_w // 2, src_h // 2)
 
-        cx, cy = last_center
-        y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
+            cx, cy = last_center
+            y0 = max(0, min(src_h - crop_h, cy - crop_h // 2))
 
-        if slide_effect and max_x0 > 0:
-            progress = slide_progress(frame_index / fps if fps else 0.0, slide_segments)
-            x0 = slide_base + int(round(progress * travel))
-            x0 = max(0, min(max_x0, x0))
-        else:
-            x0 = max(0, min(max_x0, cx - crop_w // 2))
+            if slide_effect and max_x0 > 0:
+                progress = slide_progress(
+                    frame_index / fps if fps else 0.0, slide_segments
+                )
+                x0 = slide_base + int(round(progress * travel))
+                x0 = max(0, min(max_x0, x0))
+            else:
+                x0 = max(0, min(max_x0, cx - crop_w // 2))
 
-        cropped = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
-        writer.write(cropped)
-        frame_index += 1
-
-    cap.release()
-    writer.release()
+            # ``frame[...]`` is a strided *view* of the decoded frame. Some
+            # OpenCV builds (4.14.x) raise "Unknown C++ exception from OpenCV
+            # code" when a non-contiguous array reaches ``VideoWriter.write``,
+            # so hand it a contiguous copy instead.
+            cropped = np.ascontiguousarray(frame[y0 : y0 + crop_h, x0 : x0 + crop_w])
+            writer.write(cropped)
+            frame_index += 1
+    finally:
+        # Always release the reader and the writer: on Windows the reader keeps
+        # an open handle on the cut clip, so if an error skips this the caller's
+        # cleanup cannot delete that file (WinError 32) and the real error gets
+        # masked by the failed removal.
+        cap.release()
+        writer.release()
 
     # Mux audio from the cut clip back onto the silent reframed video.
     cmd = [
