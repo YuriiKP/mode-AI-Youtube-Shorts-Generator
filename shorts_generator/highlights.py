@@ -22,80 +22,32 @@ from .visual_indexer import format_merged_log, merge_transcripts_and_visuals
 
 LLMFn = Callable[[str], str]
 
-
-# --- English prompts (commented out; the Russian versions below are used) ---
-#
-# CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
-# Choose one: podcast, interview, tutorial, lecture, commentary, debate, vlog, other.
-# Also estimate content density: low (mostly filler/chit-chat), medium, or high (dense info/stories).
-# Respond with JSON only: {"content_type": "...", "density": "..."}"""
-#
-#
-# VIRALITY_CRITERIA = """
-# Virality signals to prioritize (ranked by impact):
-# 1. HOOK MOMENTS — statements that create immediate curiosity ("The secret is...", "Nobody talks about...", "I was completely wrong about...")
-# 2. EMOTIONAL PEAKS — genuine surprise, laughter, anger, vulnerability, excitement; raw unscripted reactions
-# 3. OPINION BOMBS — strong, polarizing or counter-intuitive statements that trigger agree/disagree
-# 4. REVELATION MOMENTS — surprising facts, stats, or confessions that reframe how the viewer thinks
-# 5. CONFLICT/TENSION — disagreement, pushback, or a problem being confronted head-on
-# 6. QUOTABLE ONE-LINERS — a sentence that works as a standalone quote card
-# 7. STORY PEAKS — the climax or twist of an anecdote; the payoff moment
-# 8. PRACTICAL VALUE — a concrete tip, hack, or insight the viewer can immediately apply
-# """
-#
-# HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
-#
-# {virality_criteria}
-#
-# Content type: {content_type} | Density: {density}
-#
-# Your task: identify the most viral-worthy highlights from the transcript.
-#
-# Rules:
-# - Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
-# - Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect standalone one-liner. Go longer (91-180s) only when a story arc needs full context to land
-# - Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
-# - Clips must not overlap significantly with each other
-# - Score 0-100 on viral potential (not general quality)
-# - {num_clips_instruction}
-# - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
-# - Explain in one sentence why this clip is viral ("virality_reason")
-# - Write a short "description" of 1-2 sentences for posting on platforms (YouTube Shorts, TikTok, Instagram Reels); no hashtags, emoji or markdown
-#
-# Respond ONLY with valid JSON (no markdown, no explanation):
-# {{"highlights":[{{"title":"string","description":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
-
-
 # --- Russian prompts ---
-CONTENT_TYPE_PROMPT = """Проанализируй этот образец транскрипта видео и определи тип контента.
+CONTENT_TYPE_PROMPT = """
+Проанализируй образец транскрипта (диалоги + возможные визуальные описания) и определи тип контента.
 Выбери один: podcast, interview, tutorial, lecture, commentary, debate, vlog, anime, other.
-(anime — нарезка из аниме или сериала с диалогами, конфликтом и резкими репликами.)
-Также оцени плотность контента: low (в основном вода и болтовня), medium или high (плотная информация/истории).
-Отвечай ТОЛЬКО в формате JSON: {"content_type": "...", "density": "..."}"""
-
-
-VIRALITY_CRITERIA = """
-ГЛАВНОЕ ПРАВИЛО: Первые 1–3 секунды решают всё. Зритель смахивает видео за доли секунды, поэтому клип обязан начинаться СРАЗУ с хука — без разгона, предыстории и «раньше в серии…».
-
-ФОРМУЛА ЗАЛЕТЕВШЕГО КЛИПА (нужны все три части):
-1. ХУК — первая же реплика бьёт в цель: шокирующее или абсурдное заявление, дерзкий вызов, провокационный вопрос, начало конфликта или легендарный reveal.
-2. НАГНЕТАНИЕ — короткие реплики-реакции («Чего?», «Из рода?») и повторы раскачивают комизм или напряжение.
-3. ПАНЧЛАЙН / REVEAL — последняя реплика добивает: развязка, твист, названное имя или титул, жёсткая либо пафосная фраза.
-
-Клип держится как законченная микро-история: ничего лишнего ДО хука и ни одной оборванной мысли ПОСЛЕ панчлайна.
-
-СИГНАЛЫ ВИРАЛЬНОСТИ (по убыванию силы):
-1. ШОК И АБСУРД ДЕЙСТВИЯ — персонаж совершает немыслимое («выбирайте себе, какие понравятся» о трупах; «не отобьём, не спасём, а захватим?»). Зритель застревает на вопросе «Зачем он это делает?».
-2. ДЕРЗОСТЬ И ВЫЗОВ — нахальство, отказ подчиняться, прямая конфронтация («Каков наглец», «Не дури меня!»).
-3. ЭПИЧНЫЙ REVEAL / ПРЕДСТАВЛЕНИЕ СИЛЫ — герой раскрывает имя, титул или скрытую мощь; легенда оказывается живой («Я Набунага. Глава рода Ода, Великий Набунага»).
-4. ТВИСТ ФАКТА — объяснение или деталь, которые в последней фразе переворачивают всё («патоген поражает не человека, а зарождающуюся жизнь в его теле»).
-5. ТЁМНАЯ / ЖЁСТКАЯ ШУТКА — циничная развязка, чёрный юмор («тела можем использовать для нашего плана»).
-6. ЭМОЦИОНАЛЬНЫЙ ПИК — всплеск ярости, отчаяния, триумфа; перелом в битве или слом героя.
-
-ХУКИ И НЕДОСКАЗАННОСТЬ — завязка конфликта, фраза-триггер, диалог, обрывающийся ПЕРЕД ответом; недосказанность держит внимание, но сам клип обрывать на полуфразе НЕЛЬЗЯ.
-
-КЛИП ДОЛЖЕН БЫТЬ ЦЕЛЬНЫМ, НЕ ОБРЫВАТЬСЯ НА ПОЛУФРАЗЕ. ПРОВЕРЯЙ ЭТО!
+Также оцени плотность контента: low (в основном вода/тишина), medium или high (плотная информация/динамика).
+Отвечай ТОЛЬКО в формате JSON: {"content_type": "...", "density": "..."}
 """
+
+
+VIRALITY_CRITERIA = """Ты элитный режиссер монтажа Shorts, Reels и TikTok. Твоя задача — извлечь самые виральные, логически завершенные и цельные моменты из лога видео.
+
+{virality_criteria}
+
+{content_hint}
+
+{visual_hint}
+
+ПРАВИЛА НАРЕЗКИ:
+1. Длительность: 20–60 секунд. Игнорируй микро-моменты короче 15 секунд. Если логика сцены требует 60 секунд для полного раскрытия контекста — бери весь фрагмент.
+2. Границы клипа: Начинай ровно с хука и заканчивай чётким панчлайном. Бери точные значения start_time и end_time из лога [начало - конец].
+3. Изолированность: Хайлайты не должны пересекаться и не должны стоять впритык друг к другу. Выбирай только лучшие моменты с паузами между ними.
+4. Оценка 0-100 по виральному потенциалу.
+5. {num_clips_instruction}
+
+Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений) со строгим соблюдением структуры:
+{{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","title":"string","description":"string","tags":["string"],"start_time":float,"end_time":float,"score":int,"laugh_score":int,"cringe_score":int,"intrigue_score":int,"hook_sentence":"string","punchline":"string","virality_reason":"string"}}]}}"""
 
 HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротких вертикальных видео, изучивший тысячи вирусных клипов в TikTok, Instagram Reels и YouTube Shorts. Ты точно знаешь, что заставляет зрителей прекратить листать, досматривать до конца и делиться.
 
@@ -138,7 +90,7 @@ MAX_HIGHLIGHT_API_ATTEMPTS = 3
 # выбранной LLM, чтобы попасть на настоящую границу фразы — конец предложения
 # или паузу. Ограничение не даёт транскрипту без пунктуации и пауз растянуть
 # или обрезать клип далеко от задуманного окна.
-_MAX_PHRASE_SHIFT = 5.0
+_MAX_PHRASE_SHIFT = 9.0
 
 # Насколько «ближе» считается граница, закрывающая предложение (с точкой,
 # вопросом или восклицанием), по сравнению с границей, за которой лишь пауза.

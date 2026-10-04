@@ -182,6 +182,16 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         "runs, so re-cutting the same video skips the Gemini/Florence requests "
         "(default: on)",
     )
+    parser.add_argument(
+        "--visual-indexer-max-height",
+        dest="visual_indexer_max_height",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="downscale the frames (and the gemini_video upload) to at most "
+        "this height before the model sees them: 0 keeps the source resolution "
+        "(default: 0)",
+    )
 
 
 def _add_music_options(parser: argparse.ArgumentParser) -> None:

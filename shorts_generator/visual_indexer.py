@@ -139,10 +139,17 @@ def _timeline_end(segments: Sequence[Dict], scenes: Sequence[Dict]) -> float:
 
 
 class _FrameExtractor:
-    """Context manager that seeks an OpenCV capture and returns RGB frames."""
+    """Context manager that seeks an OpenCV capture and returns RGB frames.
 
-    def __init__(self, video_path: str) -> None:
+    ``max_height`` (0 = keep the source resolution) downscales every returned
+    frame so it is at most that many pixels tall. Frame-based cloud engines send
+    each frame as an image, so a smaller frame means fewer tokens; the aspect
+    ratio is preserved.
+    """
+
+    def __init__(self, video_path: str, max_height: int = 0) -> None:
         self.video_path = video_path
+        self.max_height = int(max_height) if max_height else 0
         self._cv2 = None
         self._cap = None
 
@@ -165,7 +172,23 @@ class _FrameExtractor:
         ok, frame = self._cap.read()
         if not ok:
             return None
-        return self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        return self._maybe_downscale(rgb)
+
+    def _maybe_downscale(self, rgb):
+        """Shrink a frame so its height is at most ``max_height`` (never grows)."""
+        if self.max_height <= 0 or rgb is None:
+            return rgb
+        height, width = rgb.shape[:2]
+        if height <= self.max_height:
+            return rgb
+        scale = self.max_height / float(height)
+        new_width = max(1, int(round(width * scale)))
+        return self._cv2.resize(
+            rgb,
+            (new_width, self.max_height),
+            interpolation=self._cv2.INTER_AREA,
+        )
 
     def close(self) -> None:
         if self._cap is not None:
@@ -194,6 +217,89 @@ def _probe_duration(video_path: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def _probe_dimensions(video_path: str) -> Tuple[int, int]:
+    """Best-effort ``(width, height)`` of a video (``(0, 0)`` when unreadable)."""
+    try:
+        import cv2  # type: ignore
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0, 0
+        try:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
+        finally:
+            cap.release()
+        return width, height
+    except Exception:
+        return 0, 0
+
+
+def _downscale_for_upload(
+    video_path: str, max_height: int, ffmpeg_path: str = ""
+) -> Tuple[str, Optional[str]]:
+    """Return ``(path_to_upload, temp_dir_or_None)`` shrunk to ``max_height``.
+
+    The whole-video engine uploads the file to the Gemini Files API: a smaller
+    file reaches Gemini sooner and finishes processing faster, so a 1080p source
+    is re-encoded once to ``max_height`` before it is sent. The file is only ever
+    *shrunk* — when it is already at or below ``max_height``, when its height
+    cannot be read, or when FFmpeg is missing, the original path is returned
+    unchanged and ``temp_dir`` is ``None`` (nothing to clean up).
+    """
+    if max_height <= 0:
+        return video_path, None
+    _, height = _probe_dimensions(video_path)
+    if height and height <= max_height:
+        return video_path, None
+
+    import subprocess
+
+    from .postprocess.ffmpeg import resolve_ffmpeg_binary
+
+    ffmpeg = resolve_ffmpeg_binary(ffmpeg_path)
+    temp_dir = tempfile.mkdtemp(prefix="vi_scale_")
+    out_path = os.path.join(temp_dir, "video.mp4")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-vf",
+        f"scale=-2:{int(max_height)}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as exc:  # noqa: BLE001 - fall back to the original file
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(
+            f"[visual] could not downscale the video ({exc}); uploading the original",
+            flush=True,
+        )
+        return video_path, None
+
+    size = os.path.getsize(out_path)
+    print(
+        f"[visual] downscaled the upload to {int(max_height)}p "
+        f"({size / (1024 * 1024):.1f} MB)",
+        flush=True,
+    )
+    return out_path, temp_dir
 
 
 def _ascii_upload_path(video_path: str):
@@ -425,6 +531,15 @@ class BaseVisualIndexer(ABC):
         start, end = float(scene[0]), float(scene[1])
         return start + (end - start) / 2.0
 
+    def _frame_max_height(self) -> int:
+        """Resolve ``VISUAL_INDEXER_MAX_HEIGHT`` (0 = keep the source size)."""
+        try:
+            return max(
+                0, int(getattr(self.settings, "visual_indexer_max_height", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            return 0
+
 
 # ---------------------------------------------------------------------------
 # Local engine: Florence-2
@@ -524,7 +639,7 @@ class FlorenceIndexer(BaseVisualIndexer):
 
         task = FLORENCE_TASK
         results: List[Dict[str, Any]] = []
-        with _FrameExtractor(self.video_path) as extractor:
+        with _FrameExtractor(self.video_path, self._frame_max_height()) as extractor:
             for scene in scenes:
                 rgb = extractor.frame_rgb(self.midpoint(scene))
                 if rgb is None:
@@ -634,7 +749,7 @@ class GeminiFlashIndexer(BaseVisualIndexer):
         )
         model = self.settings.gemini_model or "gemini-2.5-flash"
         results: List[Dict[str, Any]] = []
-        with _FrameExtractor(self.video_path) as extractor:
+        with _FrameExtractor(self.video_path, self._frame_max_height()) as extractor:
             for batch in _chunks(scenes, batch_size):
                 prepared = []
                 for scene in batch:
@@ -759,6 +874,9 @@ def _visual_cache_signature(settings: Settings) -> Dict[str, Any]:
         "model": model,
         "scene_threshold": round(float(settings.visual_indexer_scene_threshold), 3),
         "max_scene_seconds": round(float(settings.visual_indexer_max_scene_seconds), 3),
+        # The frame/upload height cap changes the sampled images, so a different
+        # VISUAL_INDEXER_MAX_HEIGHT must invalidate the cached index.
+        "max_height": int(getattr(settings, "visual_indexer_max_height", 0) or 0),
     }
 
 
@@ -1201,7 +1319,15 @@ class GeminiVideoIndexer(BaseVisualIndexer):
 
     # -- Files API ---------------------------------------------------------
     def _upload(self, client):
-        upload_path, cleanup_dir = _ascii_upload_path(self.video_path)
+        # Shrink the file first when VISUAL_INDEXER_MAX_HEIGHT is set: a smaller
+        # upload reaches Gemini sooner and finishes processing faster. The
+        # source itself is never touched — a downscaled copy lands in a temp dir.
+        scaled_path, scale_dir = _downscale_for_upload(
+            self.video_path,
+            self._frame_max_height(),
+            getattr(self.settings, "ffmpeg_path", ""),
+        )
+        upload_path, cleanup_dir = _ascii_upload_path(scaled_path)
         try:
             size = os.path.getsize(upload_path)
             print(
@@ -1223,6 +1349,8 @@ class GeminiVideoIndexer(BaseVisualIndexer):
         finally:
             if cleanup_dir:
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
+            if scale_dir:
+                shutil.rmtree(scale_dir, ignore_errors=True)
         if state == "FAILED":
             raise RuntimeError("Gemini failed to process the uploaded video")
         print(f"[visual] video uploaded and processed (state={state})", flush=True)

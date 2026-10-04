@@ -311,6 +311,14 @@ class Settings:
     visual_indexer_batch_size: int = 8  # gemini: сколько кадров на запрос
     visual_indexer_scene_threshold: float = 27.0
     visual_indexer_max_scene_seconds: float = 15.0
+    # Максимальная высота кадра для визуальной индексации, в пикселях
+    # (0 = как в исходном видео). Кадры для florence / gemini уменьшаются до
+    # этой высоты перед отправкой в модель; для gemini_video в это разрешение
+    # перекодируется сам файл перед загрузкой в Gemini Files. Меньшая высота
+    # ускоряет загрузку и обработку облаком и сокращает число токенов в
+    # покадровом режиме (gemini), но не меняет токены в режиме целого видео
+    # (gemini_video) и почти не влияет на скорость Florence.
+    visual_indexer_max_height: int = 0
     # Кэш индекса визуала: результат индексации сохраняется рядом с видео
     # (``<video>.visual.json``) и переиспользуется на следующих запусках.
     # Так повторная нарезка того же ролика — с другим NUM_CLIPS или иными
@@ -550,6 +558,7 @@ _INT_FIELDS = {
     "subtitle_shadow_offset_y",
     "unique_crop",
     "visual_indexer_batch_size",
+    "visual_indexer_max_height",
     "llm_max_attempts",
 }
 _FLOAT_FIELDS = {
@@ -793,6 +802,11 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("VISUAL_INDEXER_SCENE_THRESHOLD must be greater than 0")
     if settings.visual_indexer_max_scene_seconds <= 0:
         raise ConfigError("VISUAL_INDEXER_MAX_SCENE_SECONDS must be greater than 0")
+    if settings.visual_indexer_max_height < 0:
+        raise ConfigError(
+            "VISUAL_INDEXER_MAX_HEIGHT must be zero (source resolution) or a "
+            "positive integer"
+        )
     if settings.llm_max_attempts < 1:
         raise ConfigError("LLM_MAX_ATTEMPTS must be at least 1")
     if settings.llm_retry_backoff < 0:
