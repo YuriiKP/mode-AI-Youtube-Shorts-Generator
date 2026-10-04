@@ -19,10 +19,16 @@ from .clipper import crop_highlights
 from .config import Settings
 from .downloader import download_youtube
 from .enhance import enhance_shorts
-from .highlights import get_highlights, snap_highlights_to_transcript
+from .highlights import (
+    dedupe_highlights,
+    get_highlights,
+    select_highlights,
+    snap_highlights_to_transcript,
+)
 from .subtitles import find_video_files
 from .timing import start_timer
 from .transcriber import transcribe
+from .visual_indexer import index_video
 
 # How many boundary words to show per clip edge in the analysis log.
 _CUT_LOG_WORDS = 4
@@ -103,9 +109,20 @@ def _process_one(
             f"speech: {os.path.basename(source_path)}"
         )
 
+    # Optional visual indexing (step between transcription and ranking): it
+    # describes what happens on screen so the ranker can favour moments where
+    # the words are reinforced by a strong visual. Off by default.
+    visuals: Dict = {"engine": "none", "scenes": []}
+    if settings.visual_indexer_enabled:
+        with timer.stage("visual"):
+            visuals = index_video(source_path, settings)
+
     with timer.stage("highlights"):
         highlights_result = get_highlights(
-            transcript, settings, num_clips=settings.num_clips
+            transcript,
+            settings,
+            num_clips=settings.num_clips,
+            visuals=visuals,
         )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
@@ -114,17 +131,13 @@ def _process_one(
             f"{os.path.basename(source_path)}."
         )
 
-    top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[
-        : settings.num_clips
-    ]
-    print(
-        f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates",
-        flush=True,
-    )
-
+    # Границы выбирает LLM по началам реплик, поэтому привязка к фразам идёт до
+    # отбора: разные моменты могут схлопнуться в одно и то же окно, и тогда
+    # дедуп ниже отбросит дубликат, а в топ попадёт следующий кандидат (иначе в
+    # выдаче оказывались два одинаковых клипа).
     if settings.clip_snap_to_transcript:
         snap_highlights_to_transcript(
-            top,
+            all_highlights,
             transcript,
             start_padding=settings.clip_start_padding,
             end_padding=settings.clip_end_padding,
@@ -133,6 +146,22 @@ def _process_one(
             pause_threshold=settings.subtitle_pause_threshold,
             max_end=float(transcript.get("duration", 0.0)) or None,
         )
+
+    all_highlights = dedupe_highlights(all_highlights)
+    # Слишком короткие моменты (LLM порой отдаёт окна в 0.15–0.5 с) здесь либо
+    # достраиваются до CLIP_MIN_DURATION, либо отбрасываются: в нарезку не уходит
+    # обрубок, а освободившееся место достаётся следующему кандидату по оценке.
+    top = select_highlights(
+        all_highlights,
+        transcript,
+        num_clips=settings.num_clips,
+        min_duration=settings.clip_min_duration,
+        max_end=float(transcript.get("duration", 0.0)) or None,
+    )
+    print(
+        f"[pipeline] cropping {len(top)} of {len(all_highlights)} candidates",
+        flush=True,
+    )
 
     # Analysis log: show what was actually selected for cutting — each clip's
     # time window plus a few words from its start and end phrases.
@@ -164,6 +193,7 @@ def _process_one(
     return {
         "source_video_url": source_path,
         "transcript": transcript,
+        "visuals": visuals,
         "highlights": all_highlights,
         "shorts": shorts,
     }
@@ -210,6 +240,7 @@ def _run(
             videos[0]["source_video_url"] if single else list(source_paths)
         ),
         "transcript": videos[0]["transcript"] if single else None,
+        "visuals": videos[0].get("visuals") if single else None,
         "highlights": [h for v in videos for h in v["highlights"]],
         "shorts": [s for v in videos for s in v["shorts"]],
         "videos": videos,

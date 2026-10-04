@@ -150,6 +150,38 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         help="fraction of the full crop travel used by the slide: 1 = edge to "
         "edge, 0 = no movement (default: 1)",
     )
+    parser.add_argument(
+        "--visual-indexing",
+        dest="visual_indexer_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="index the on-screen visuals and feed them to highlight ranking "
+        "(default: off)",
+    )
+    parser.add_argument(
+        "--visual-indexer-type",
+        dest="visual_indexer_type",
+        choices=("florence", "gemini", "gemini_video", "none"),
+        default=None,
+        help="visual indexer engine: florence (local, transformers/torch) or "
+        "gemini (cloud, google-genai) (default: florence)",
+    )
+    parser.add_argument(
+        "--visual-indexer-model",
+        dest="visual_indexer_model",
+        default=None,
+        metavar="MODEL",
+        help="model id for the florence engine (default: microsoft/Florence-2-large)",
+    )
+    parser.add_argument(
+        "--visual-indexer-cache",
+        dest="visual_indexer_cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="save the visual index next to the video and reuse it on later "
+        "runs, so re-cutting the same video skips the Gemini/Florence requests "
+        "(default: on)",
+    )
 
 
 def _add_music_options(parser: argparse.ArgumentParser) -> None:

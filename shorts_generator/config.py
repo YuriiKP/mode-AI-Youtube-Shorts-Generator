@@ -39,6 +39,10 @@ VALID_BANNER_POSITIONS = ("top", "bottom", "center")
 # the animation entirely.
 VALID_SUBTITLE_ANIMATIONS = ("fade", "slide", "pop")
 
+# Engines for the visual-indexing step (VISUAL_INDEXER_TYPE). "none" disables
+# it, mirroring VISUAL_INDEXER_ENABLED=false.
+VALID_VISUAL_INDEXER_TYPES = ("florence", "gemini", "gemini_video", "none")
+
 DEFAULT_TEXT_FORE_COLOR = "#FFFFFF"
 DEFAULT_STROKE_COLOR = "#000000"
 DEFAULT_SHADOW_COLOR = "#000000"
@@ -256,6 +260,12 @@ class Settings:
     clip_snap_to_transcript: bool = True
     clip_start_padding: float = 0.15
     clip_end_padding: float = 0.4
+    # Минимальная длительность клипа (секунды). LLM нередко возвращает окно в
+    # одну-две реплики, и клип выходит в 2–3 секунды — для Shorts это мусор.
+    # Если после привязки к фразам клип короче, окно достраивается целыми
+    # репликами в обе стороны, пока не наберётся минимум (не заходя в соседние
+    # клипы и за пределы видео). 0 отключает выравнивание длительности.
+    clip_min_duration: float = 15.0
 
     # Скольжение по кадру между переходами (монтажный эффект на этапе нарезки)
     # ----------------------------------------------------------------
@@ -284,6 +294,29 @@ class Settings:
     deepseek_base_url: str = "https://api.deepseek.com"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    # Повторы при временных ошибках провайдера (429/5xx/"high demand"/таймаут):
+    # сколько попыток на один запрос к LLM и базовый бэкофф в секундах; задержка
+    # растёт вдвое: base, 2*base, 4*base, ...
+    llm_max_attempts: int = 5
+    llm_retry_backoff: float = 2.0
+
+    # Visual Indexing (шаг между транскрибацией и ранжированием) ------------
+    # Анализ видеоряда: описывает, что происходит на экране (эмоции, действия,
+    # объекты, графика), и обогащает контекст для LLM-ранжирования. Выключено
+    # по умолчанию, чтобы не менять текущий воркфлоу.
+    visual_indexer_enabled: bool = False
+    visual_indexer_type: str = "florence"  # florence | gemini | none
+    visual_indexer_model: str = "microsoft/Florence-2-large"
+    visual_indexer_device: str = "auto"  # auto | cpu | cuda
+    visual_indexer_batch_size: int = 8  # gemini: сколько кадров на запрос
+    visual_indexer_scene_threshold: float = 27.0
+    visual_indexer_max_scene_seconds: float = 15.0
+    # Кэш индекса визуала: результат индексации сохраняется рядом с видео
+    # (``<video>.visual.json``) и переиспользуется на следующих запусках.
+    # Так повторная нарезка того же ролика — с другим NUM_CLIPS или иными
+    # настройками клипов — не гоняет запросы к Gemini/Florence заново, пока
+    # само видео и параметры индексатора не изменились.
+    visual_indexer_cache: bool = True
 
     # Whisper (faster-whisper) ---------------------------------------------
     whisper_model: str = "base"
@@ -472,6 +505,8 @@ _STR_FIELDS = {
     "deepseek_base_url",
     "gemini_api_key",
     "gemini_model",
+    "visual_indexer_model",
+    "visual_indexer_device",
     "whisper_model",
     "whisper_device",
     "whisper_language",
@@ -498,6 +533,8 @@ _BOOL_FIELDS = {
     "unique_loudness",
     "unique_metadata",
     "unique_randomize",
+    "visual_indexer_enabled",
+    "visual_indexer_cache",
 }
 _INT_FIELDS = {
     "num_clips",
@@ -512,6 +549,8 @@ _INT_FIELDS = {
     "subtitle_shadow_offset_x",
     "subtitle_shadow_offset_y",
     "unique_crop",
+    "visual_indexer_batch_size",
+    "llm_max_attempts",
 }
 _FLOAT_FIELDS = {
     "music_volume",
@@ -530,6 +569,7 @@ _FLOAT_FIELDS = {
     "subtitle_offset",
     "clip_start_padding",
     "clip_end_padding",
+    "clip_min_duration",
     "saturation",
     "sharpness",
     "chromatic_aberration",
@@ -544,6 +584,9 @@ _FLOAT_FIELDS = {
     "unique_pitch",
     "unique_gain",
     "unique_jitter",
+    "visual_indexer_scene_threshold",
+    "visual_indexer_max_scene_seconds",
+    "llm_retry_backoff",
 }
 
 
@@ -583,6 +626,8 @@ def _coerce(field_name: str, raw: Any, current: Any) -> Any:
         return _as_choice(raw, key, str(current), VALID_SUBTITLE_SOURCES)
     if field_name == "banner_position":
         return _as_choice(raw, key, str(current), VALID_BANNER_POSITIONS)
+    if field_name == "visual_indexer_type":
+        return _as_choice(raw, key, str(current), VALID_VISUAL_INDEXER_TYPES)
     return _as_str(raw, current)
 
 
@@ -660,6 +705,8 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(
             "CLIP_START_PADDING and CLIP_END_PADDING must be zero or greater"
         )
+    if settings.clip_min_duration < 0:
+        raise ConfigError("CLIP_MIN_DURATION must be zero (off) or greater")
     if settings.slide_transition_gap < 0:
         raise ConfigError("SLIDE_TRANSITION_GAP must be zero or greater")
     if not 0.0 <= settings.slide_range <= 1.0:
@@ -740,6 +787,16 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("UNIQUE_GAIN must be between -20 and 20 dB")
     if not 0.0 <= settings.unique_jitter <= 1.0:
         raise ConfigError("UNIQUE_JITTER must be between 0 and 1")
+    if settings.visual_indexer_batch_size < 1:
+        raise ConfigError("VISUAL_INDEXER_BATCH_SIZE must be at least 1")
+    if settings.visual_indexer_scene_threshold <= 0:
+        raise ConfigError("VISUAL_INDEXER_SCENE_THRESHOLD must be greater than 0")
+    if settings.visual_indexer_max_scene_seconds <= 0:
+        raise ConfigError("VISUAL_INDEXER_MAX_SCENE_SECONDS must be greater than 0")
+    if settings.llm_max_attempts < 1:
+        raise ConfigError("LLM_MAX_ATTEMPTS must be at least 1")
+    if settings.llm_retry_backoff < 0:
+        raise ConfigError("LLM_RETRY_BACKOFF must be zero or greater")
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +826,8 @@ def require_gemini_key(settings: Settings) -> str:
     if not settings.gemini_api_key:
         raise RuntimeError(
             "GEMINI_API_KEY is not set. It is required when "
-            "LLM_PROVIDER=gemini. Add it to your .env or switch LLM_PROVIDER."
+            "LLM_PROVIDER=gemini, or for the cloud visual indexer "
+            "(VISUAL_INDEXER_TYPE=gemini / gemini_video). Add it to your .env, "
+            "switch LLM_PROVIDER, or use VISUAL_INDEXER_TYPE=florence."
         )
     return settings.gemini_api_key

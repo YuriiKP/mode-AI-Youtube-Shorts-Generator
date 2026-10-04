@@ -1,11 +1,30 @@
 # Local pipeline: download, transcription, highlight ranking, vertical crop.
 yt-dlp>=2024.1.1
 faster-whisper>=1.0.0
+# faster-whisper passes `metadata_errors` to av.open, but PyAV 19 dropped that
+# parameter (along with metadata_encoding), so the audio-decode step dies with
+# "open() got an unexpected keyword argument 'metadata_errors'". Pin below 19
+# (18.1.0 ships an abi3 wheel, so it works on current Pythons too).
+av>=18,<19
 openai>=1.0.0
 google-genai>=1.0.0
 opencv-python>=4.8,<5
-# torch is only needed for CUDA Whisper; CPU works without it.
+# torch: needed for CUDA Whisper and for the local (florence) visual indexer.
+# `pip install torch` on Windows installs a CPU-only build, which silently sends
+# the indexer to the CPU; for GPU install the CUDA wheel from PyTorch's index
+# (match the CUDA version your driver supports):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu130
 # torch>=2.0
+# Visual Indexing (set VISUAL_INDEXER_ENABLED=true, see shorts_generator/visual_indexer.py):
+#   * VISUAL_INDEXER_TYPE=florence needs torch + transformers, and also einops
+#     and timm (imported by Florence-2's remote modeling code). It only runs on
+#     transformers 4.x: 5.x, and the very latest 4.x which start reading
+#     `_supports_sdpa`, break its remote code. Verified working:
+#         pip install "transformers>=4.41,<4.54" einops timm
+#   * VISUAL_INDEXER_TYPE=gemini uses the google-genai SDK already listed above.
+# transformers>=4.41,<4.54
+# einops
+# timm
 
 # Post-processing engine: burn subtitles in and mix background music.
 moviepy==2.2.1

@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .config import Settings
 from .cues import phrase_boundaries
 from .llm import call_llm
+from .visual_indexer import format_merged_log, merge_transcripts_and_visuals
 
 LLMFn = Callable[[str], str]
 
@@ -102,7 +103,9 @@ HIGHLIGHT_SYSTEM_PROMPT = """Ты элитный редактор коротки
 
 {content_hint}
 
-Твоя задача: определить самые виральные моменты (хайлайты) в транскрипте.
+{visual_hint}
+
+Твоя задача: определить самые виральные моменты (хайлайты) в логе видео.
 
 Правила:
 - Начинай клип ровно на хуке и заканчивай ровно на панчлайне. Не тяни разгон, контекст и продолжение «на всякий случай».
@@ -272,12 +275,31 @@ def detect_content_type(transcript: Dict, llm_fn: LLMFn) -> Dict[str, str]:
         return {"content_type": "other", "density": "medium"}
 
 
+def _has_visuals(visuals: Optional[Dict]) -> bool:
+    """True when a visual index with at least one described scene is present."""
+    return bool(visuals and visuals.get("scenes"))
+
+
+def build_transcript_log(transcript: Dict, visuals: Optional[Dict] = None) -> str:
+    """Build the ranking log, enriched with visual context when available.
+
+    Without visuals this is the plain transcript log. With visuals the merge
+    produces windowed lines like
+    [Time: 00:00 - 00:15] Transcript: "...", Visuals: "...".
+    """
+    if _has_visuals(visuals):
+        entries = merge_transcripts_and_visuals(transcript.get("segments", []), visuals)
+        if entries:
+            return format_merged_log(entries)
+    return build_transcript_text(transcript)
+
+
 def build_transcript_text(transcript: Dict) -> str:
     segments = transcript.get("segments", [])
     return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
 
 
-def chunk_transcript(transcript: Dict) -> List[Dict]:
+def chunk_transcript(transcript: Dict, visuals: Optional[Dict] = None) -> List[Dict]:
     segments = transcript.get("segments", [])
     duration = transcript.get("duration", segments[-1]["end"] if segments else 0)
     chunks = []
@@ -303,6 +325,20 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
             chunk["segments"] = chunk_segs
             chunk["duration"] = end - start
             chunk["_offset"] = start
+            # Visual scene descriptions are re-based to chunk-local seconds too,
+            # so the merged ranking log lines up with the local segment times.
+            if visuals and visuals.get("scenes"):
+                rebased = [
+                    {
+                        "start": max(0.0, float(scene["start"]) - start),
+                        "end": float(scene["end"]) - start,
+                        "text": scene.get("text", ""),
+                    }
+                    for scene in visuals["scenes"]
+                    if scene.get("end", 0) > start and scene.get("start", 0) < end
+                ]
+                if rebased:
+                    chunk["_visuals"] = {"scenes": rebased}
             chunks.append(chunk)
         start += CHUNK_SIZE_SECONDS - CHUNK_OVERLAP_SECONDS
     return chunks
@@ -315,6 +351,7 @@ def call_highlight_api(
     num_clips: int,
     llm_fn: LLMFn,
     is_chunk: bool = False,
+    has_visuals: bool = False,
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which can time out the model).
@@ -336,9 +373,21 @@ def call_highlight_api(
             "medium, high — плотная информация/истории) и верни их в полях "
             '"content_type" и "density".'
         )
+    if has_visuals:
+        visual_hint = (
+            "В логе для каждого таймкода два поля: transcript — что говорит "
+            "спикер, и Visuals (visual_context) — что в этот момент происходит "
+            "на экране. Оценивай синергию: момент, где слова подкрепляются "
+            "ярким визуальным действием (эмоция, смех, фейл, необычный объект, "
+            "графика), ценнее. Хук может быть и визуальным — резкое действие "
+            "в кадре."
+        )
+    else:
+        visual_hint = ""
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
         content_hint=content_hint,
+        visual_hint=visual_hint,
         num_clips_instruction=(
             f"Верни НЕ БОЛЬШЕ {min_clips} клипов, лучшие — первыми. "
             f"Можно вернуть меньше — качество важнее количества. "
@@ -575,10 +624,230 @@ def snap_highlights_to_transcript(
     return highlights
 
 
+def _cue_windows(transcript: Dict) -> List[Tuple[float, float]]:
+    """Кью транскрипта как отсортированные ``(start, end)``, без мусора."""
+    cues: List[Tuple[float, float]] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            cue_start = float(segment["start"])
+            cue_end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cue_end > cue_start:
+            cues.append((cue_start, cue_end))
+    cues.sort()
+    return cues
+
+
+def _free_span(
+    start: float,
+    end: float,
+    spans: List[Tuple[float, float]],
+    video_end: float,
+) -> Optional[Tuple[float, float]]:
+    """Свободное место вокруг ``[start, end]`` с учётом занятых ``spans``.
+
+    Возвращает ``(lower, upper)`` — до какой границы можно расширять окно влево
+    и вправо, не заезжая в соседей и за пределы видео. ``None`` означает, что
+    окно пересекается с занятым диапазоном: расширяться нельзя.
+    """
+    lower, upper = 0.0, video_end
+    for other_start, other_end in spans:
+        if other_end <= start:
+            lower = max(lower, other_end)
+        elif other_start >= end:
+            upper = min(upper, other_start)
+        else:
+            return None
+    return lower, upper
+
+
+# Насколько окно может «перелететь» минимум, цепляясь за границу реплики. Если
+# ближайшая граница дальше, чем осталось добрать, плюс этот запас — за неё не
+# цепляемся: в транскрипте бывают дыры в десятки секунд (тишина, музыка, эндинг),
+# и прыжок через такую дыру склеил бы в клип полминуты пустоты. Вместо прыжка
+# окно добивается ровно до минимума.
+_GROW_OVERSHOOT_TOLERANCE = 3.0
+
+
+def _grow_window(
+    start: float,
+    end: float,
+    cues: List[Tuple[float, float]],
+    *,
+    lower: float,
+    upper: float,
+    min_duration: float,
+) -> Tuple[float, float]:
+    """Расширить ``[start, end]`` до ``min_duration``, не выходя за пределы.
+
+    Окно растёт целыми кью: на каждом шаге добавляется кью, ближайшая к текущему
+    краю, — так клип остаётся на границах реплик, а не обрывается посреди слова.
+    Границы, стоящие дальше, чем осталось добрать (плюс
+    ``_GROW_OVERSHOOT_TOLERANCE``), игнорируются: в транскрипте бывают длинные
+    дыры (тишина, музыка, эндинг), и цепляние за границу за такой дырой раздуло
+    бы клип на десятки секунд пустоты. Если кью не заполняют окно, остаток
+    добирается свободным местом между ``lower`` и ``upper``.
+    """
+    starts = [cue[0] for cue in cues if lower <= cue[0] <= start]
+    ends = [cue[1] for cue in cues if end <= cue[1] <= upper]
+    new_start, new_end = start, end
+    next_start, next_end = len(starts) - 1, 0
+    while new_end - new_start < min_duration and (
+        next_start >= 0 or next_end < len(ends)
+    ):
+        # Сколько ещё нужно добрать, с запасом на «перелёт» до границы реплики.
+        budget = min_duration - (new_end - new_start) + _GROW_OVERSHOOT_TOLERANCE
+        grow_start = starts[next_start] if next_start >= 0 else None
+        grow_end = ends[next_end] if next_end < len(ends) else None
+        if grow_start is not None and new_start - grow_start > budget:
+            grow_start = None
+        if grow_end is not None and grow_end - new_end > budget:
+            grow_end = None
+        if grow_start is None and grow_end is None:
+            # Остались только далёкие границы — не прыгаем, добиваем ниже.
+            break
+        if grow_start is None:
+            new_end = grow_end
+            next_end += 1
+        elif grow_end is None:
+            new_start = grow_start
+            next_start -= 1
+        elif grow_end - new_end <= new_start - grow_start:
+            new_end = grow_end
+            next_end += 1
+        else:
+            new_start = grow_start
+            next_start -= 1
+
+    if new_end - new_start < min_duration:
+        deficit = min_duration - (new_end - new_start)
+        take = min(new_start - lower, deficit)
+        new_start -= take
+        deficit -= take
+        new_end += min(upper - new_end, deficit)
+
+    return max(0.0, new_start), min(new_end, upper)
+
+
+def enforce_min_clip_duration(
+    highlights: List[Dict],
+    transcript: Dict,
+    *,
+    min_duration: float,
+    max_end: Optional[float] = None,
+) -> List[Dict]:
+    """Дотянуть слишком короткие клипы до ``min_duration`` (на месте).
+
+    LLM нередко возвращает окно в одну-две реплики, и после привязки к фразам
+    клип выходит в 2–3 секунды — для Shorts это мусор. Короткое окно
+    достраивается целыми кью транскрипта в обе стороны, пока не наберётся
+    ``min_duration``.
+
+    Расширение не заходит в соседние клипы и за пределы видео, поэтому наложений
+    не создаёт, но если места рядом нет, клип остаётся коротким — такие окна
+    отбрасывает :func:`select_highlights`. ``min_duration <= 0`` отключает шаг.
+    """
+    if min_duration <= 0 or not highlights:
+        return highlights
+
+    cues = _cue_windows(transcript)
+    if not cues:
+        return highlights
+
+    video_end = float(max_end) if max_end else cues[-1][1]
+    spans = [(float(h["start_time"]), float(h["end_time"])) for h in highlights]
+
+    for index, highlight in enumerate(highlights):
+        start, end = spans[index]
+        if end - start >= min_duration:
+            continue
+
+        room = _free_span(start, end, spans[:index] + spans[index + 1 :], video_end)
+        if room is None:
+            continue
+        lower, upper = room
+        if upper - lower <= end - start:
+            continue
+
+        new_start, new_end = _grow_window(
+            start, end, cues, lower=lower, upper=upper, min_duration=min_duration
+        )
+        if new_end - new_start <= end - start:
+            continue
+
+        print(
+            f"[highlights]   клип короче {min_duration:.0f}s — расширен "
+            f"[{start:.2f} → {end:.2f}] → [{new_start:.2f} → {new_end:.2f}] "
+            f"({new_end - new_start:.1f}s)",
+            flush=True,
+        )
+        highlight["start_time"] = round(new_start, 3)
+        highlight["end_time"] = round(new_end, 3)
+        spans[index] = (new_start, new_end)
+
+    return highlights
+
+
+def select_highlights(
+    highlights: List[Dict],
+    transcript: Dict,
+    *,
+    num_clips: int,
+    min_duration: float,
+    max_end: Optional[float] = None,
+) -> List[Dict]:
+    """Выбрать до ``num_clips`` лучших моментов, каждый не короче ``min_duration``.
+
+    Кандидаты перебираются по убыванию оценки. Короткий момент сначала
+    достраивается :func:`enforce_min_clip_duration` с учётом уже принятых клипов;
+    если места рядом не хватает, кандидат пропускается — так в нарезку не уходит
+    обрубок в 0,15 с, а освободившееся место достаётся следующему кандидату по
+    списку.
+
+    Когда ни один кандидат не дотянул до минимума (``min_duration`` больше самого
+    видео, нет транскрипта), возвращается обычный топ по оценке: лучше отдать
+    короткие клипы, чем не отдать ничего.
+    """
+    if num_clips <= 0:
+        return []
+
+    ranked = sorted(highlights, key=lambda h: int(h.get("score", 0)), reverse=True)
+    if min_duration <= 0:
+        return ranked[:num_clips]
+
+    accepted: List[Dict] = []
+    for candidate in ranked:
+        if len(accepted) >= num_clips:
+            break
+        # Принятые клипы уже не короче минимума, поэтому рост их не тронет: он
+        # достраивает только кандидата — в свободном месте рядом с ними.
+        group = accepted + [dict(candidate)]
+        enforce_min_clip_duration(
+            group, transcript, min_duration=min_duration, max_end=max_end
+        )
+        chosen = group[-1]
+        if chosen["end_time"] - chosen["start_time"] < min_duration:
+            # Рядом не нашлось места на целый клип — момент пропускается, а место
+            # достаётся следующему кандидату.
+            continue
+        accepted.append(chosen)
+
+    return accepted or ranked[:num_clips]
+
+
+def _llm_label(settings: Settings) -> str:
+    """Метка ``провайдер/модель`` для лога ранжирования."""
+    provider = (settings.llm_provider or "openai").strip().lower()
+    model = getattr(settings, provider + "_model", "?")
+    return f"{provider}/{model}"
+
+
 def get_highlights(
     transcript: Dict,
     settings: Settings,
     num_clips: int = 3,
+    visuals: Optional[Dict] = None,
 ) -> Dict:
     """Main entry point — returns ``{highlights: [...]}`` sorted by score.
 
@@ -587,9 +856,14 @@ def get_highlights(
     llm_fn: LLMFn = lambda prompt: call_llm(prompt, settings)  # noqa: E731
 
     duration = transcript.get("duration", 0)
+    print(
+        f"[highlights] ranking {duration:.0f}s of transcript with "
+        f"{_llm_label(settings)} — the LLM call, this step takes the longest",
+        flush=True,
+    )
 
     if duration >= LONG_VIDEO_THRESHOLD:
-        chunks = chunk_transcript(transcript)
+        chunks = chunk_transcript(transcript, visuals)
         print(
             f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True
         )
@@ -599,7 +873,7 @@ def get_highlights(
         content_info: Optional[Dict] = None
         for i, chunk in enumerate(chunks):
             offset = chunk.get("_offset", 0)
-            text = build_transcript_text(chunk)
+            text = build_transcript_log(chunk, chunk.get("_visuals"))
             print(
                 f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)",
                 flush=True,
@@ -611,6 +885,7 @@ def get_highlights(
                 num_clips=num_clips,
                 llm_fn=llm_fn,
                 is_chunk=True,
+                has_visuals=_has_visuals(chunk.get("_visuals")),
             )
             if content_info is None:
                 content_info = {
@@ -627,9 +902,14 @@ def get_highlights(
                 all_highlights.append(h)
         highlights = dedupe_highlights(all_highlights)
     else:
-        text = build_transcript_text(transcript)
+        text = build_transcript_log(transcript, visuals)
         result = call_highlight_api(
-            text, None, duration, num_clips=num_clips, llm_fn=llm_fn
+            text,
+            None,
+            duration,
+            num_clips=num_clips,
+            llm_fn=llm_fn,
+            has_visuals=_has_visuals(visuals),
         )
         print(
             f"[highlights] content={result.get('content_type')} density={result.get('density')} duration={duration:.0f}s",

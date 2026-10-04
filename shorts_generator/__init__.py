@@ -8,6 +8,7 @@ wrapper around the functions below.
 from .config import ConfigError, Settings, load_settings
 from .pipeline import generate_shorts, generate_subtitles, resolve_input_videos
 from .preview import render_preview_frames
+from .visual_indexer import index_video, merge_transcripts_and_visuals
 
 __all__ = [
     "Settings",
@@ -17,4 +18,6 @@ __all__ = [
     "generate_subtitles",
     "resolve_input_videos",
     "render_preview_frames",
+    "index_video",
+    "merge_transcripts_and_visuals",
 ]
