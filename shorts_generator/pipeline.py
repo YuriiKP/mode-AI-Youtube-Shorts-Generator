@@ -115,8 +115,13 @@ def _process_one(
     # the words are reinforced by a strong visual. Off by default.
     visuals: Dict = {"engine": "none", "scenes": []}
     if settings.visual_indexer_enabled:
-        with timer.stage("visual"):
-            visuals = index_video(source_path, settings)
+        # index_video times its own work on the process-wide timer: the
+        # frame-by-frame scan under ``scenes`` and the engine's descriptions
+        # (model load included) under ``visual``. Measuring it here instead
+        # would fold the scan and the model into one number — and, since the
+        # scan is often the slow part, hide where the visual step really
+        # spends its time.
+        visuals = index_video(source_path, settings)
 
     with timer.stage("highlights"):
         highlights_result = get_highlights(

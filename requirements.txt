@@ -21,14 +21,41 @@ opencv-python>=4.8,<5
 #     transformers 4.x: 5.x, and the very latest 4.x which start reading
 #     `_supports_sdpa`, break its remote code. Verified working:
 #         pip install "transformers>=4.41,<4.54" einops timm
-#   * VISUAL_INDEXER_TYPE=gemini uses the google-genai SDK already listed above.
-#   * VISUAL_INDEXER_TYPE=qwen_video runs Qwen2.5-VL locally via transformers +
-#     torch, plus qwen-vl-utils (for process_vision_info). Qwen2.5-VL needs
-#     transformers>=4.49 while Florence-2 needs <4.54, so 'transformers>=4.41'
-#     may be too old for Qwen — use 'transformers>=4.49,<4.54' to keep both
-#     working in the same venv:
-#         pip install "transformers>=4.49,<4.54" torch qwen-vl-utils
-# transformers>=4.41,<4.54
+#   * VISUAL_INDEXER_TYPE=gemini_video uses the google-genai SDK already listed above.
+#   * VISUAL_INDEXER_TYPE=qwen_video runs Qwen3.5 locally via transformers + torch.
+#     Qwen3.5 shipped in transformers 4.57 — past the 4.54 ceiling of Florence-2 —
+#     so the two engines cannot share one environment: give qwen_video its own
+#     venv. The processor turns text + images into model inputs itself, so
+#     qwen-vl-utils is no longer needed:
+#         pip install "transformers>=4.57" torch
+#   * VISUAL_INDEXER_QWEN_INPUT decides what one request carries. The default,
+#     `clip`, stacks the frames the engine sampled with OpenCV into a single
+#     video item, so the model still gets video tokens with a temporal axis and
+#     the processor writes the frame timestamps into the prompt — and nothing
+#     extra has to be installed.
+#     `video` instead cuts the window into an mp4 and lets transformers decode it,
+#     which needs torchcodec (or torchvision < 0.26, which still has read_video)
+#     plus the FFmpeg shared libraries (on Windows the "full-shared" build):
+#         pip install torchcodec
+#     `frames` is the older stills path: N separate images, no temporal axis.
+#   * Optional speed-up for qwen_video: Qwen3.5's text backbone is a hybrid of
+#     linear attention (Gated DeltaNet) and plain attention, and the DeltaNet
+#     layers silently fall back to slow, memory-hungry PyTorch ops unless the
+#     fast kernels are installed (both compile from source, and neither ships a
+#     Windows wheel):
+#         pip install causal-conv1d fla
+#   * Quantization for qwen_video (VISUAL_INDEXER_QWEN_QUANT):
+#       - Pre-quantized GPTQ checkpoints (e.g. Qwen/Qwen3.5-27B-GPTQ-Int4) are
+#         detected and loaded by transformers directly, so leave
+#         VISUAL_INDEXER_QWEN_QUANT=off and just install the backend:
+#             pip install gptqmodel               # for  -GPTQ-*   checkpoints
+#         Qwen publishes no AWQ build of Qwen3.5, and autoawq is unmaintained and
+#         generally fails to build against a recent torch anyway.
+#       - Load-time quantization of any full-precision repo (e.g.
+#         Qwen/Qwen3.5-9B) uses bitsandbytes, no pre-quantized file:
+#             pip install bitsandbytes accelerate
+#         then set VISUAL_INDEXER_QWEN_QUANT=bnb4 (NF4, ~4x smaller) or bnb8.
+# transformers>=4.41,<4.54   # florence engine; qwen_video needs >=4.57 instead
 # einops
 # timm
 

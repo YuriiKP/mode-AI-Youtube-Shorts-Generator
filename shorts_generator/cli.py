@@ -161,10 +161,10 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--visual-indexer-type",
         dest="visual_indexer_type",
-        choices=("florence", "gemini", "gemini_video", "qwen_video", "none"),
+        choices=("florence", "gemini_video", "qwen_video", "none"),
         default=None,
         help="visual indexer engine: florence / qwen_video (local, "
-        "transformers/torch) or gemini / gemini_video (cloud, google-genai) "
+        "transformers/torch) or gemini_video (cloud, google-genai) "
         "(default: florence)",
     )
     parser.add_argument(
@@ -172,7 +172,9 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         dest="visual_indexer_model",
         default=None,
         metavar="MODEL",
-        help="model id for the florence engine (default: microsoft/Florence-2-large)",
+        help="model id for the local engines: a Florence-2 checkpoint for "
+        "florence (default: microsoft/Florence-2-large) or a Qwen3.5 repo id "
+        "for qwen_video (default: Qwen/Qwen3.5-9B)",
     )
     parser.add_argument(
         "--visual-indexer-cache",

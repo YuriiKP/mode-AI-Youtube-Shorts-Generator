@@ -43,11 +43,14 @@ VALID_SUBTITLE_ANIMATIONS = ("fade", "slide", "pop")
 # it, mirroring VISUAL_INDEXER_ENABLED=false.
 VALID_VISUAL_INDEXER_TYPES = (
     "florence",
-    "gemini",
     "gemini_video",
     "qwen_video",
     "none",
 )
+
+# Что движок qwen_video отправляет в одном запросе: кадры одним видео-клипом,
+# сам фрагмент видео или отдельные кадры-картинки.
+VALID_VISUAL_INDEXER_QWEN_INPUTS = ("clip", "video", "frames")
 
 DEFAULT_TEXT_FORE_COLOR = "#FFFFFF"
 DEFAULT_STROKE_COLOR = "#000000"
@@ -319,19 +322,43 @@ class Settings:
     # объекты, графика), и обогащает контекст для LLM-ранжирования. Выключено
     # по умолчанию, чтобы не менять текущий воркфлоу.
     visual_indexer_enabled: bool = False
-    visual_indexer_type: str = "florence"  # florence | gemini | none
+    visual_indexer_type: str = "florence"  # florence | gemini_video | qwen_video | none
     visual_indexer_model: str = "microsoft/Florence-2-large"
     visual_indexer_device: str = "auto"  # auto | cpu | cuda
-    visual_indexer_batch_size: int = 8  # gemini: сколько кадров на запрос
-    visual_indexer_scene_threshold: float = 27.0
+    visual_indexer_qwen_fps: float = 1.0  # qwen_video: кадров в секунду из окна
+    # Квантование модели qwen_video при загрузке через bitsandbytes:
+    # off — без квантования (для готовых GPTQ-чекпойнтов оставьте off);
+    # bnb4 — NF4 (≈4x меньше памяти), bnb8 — 8 бит. Нужны bitsandbytes и accelerate.
+    visual_indexer_qwen_quant: str = "off"
+    # Что уходит в один запрос к qwen_video. Окно-запрос и есть сцена: движок
+    # всегда получает одну подпись на всё окно (VISUAL_INDEXER_MAX_SCENE_SECONDS
+    # секунд), а не дробление на мелкие сегменты — иначе в логе ранжирования
+    # появляется шум из почти одинаковых описаний.
+    # clip   — кадры, сэмплированные движком, складываются в один видео-элемент
+    #   в памяти: процессор патчит их в видео-токены с временной осью и сам
+    #   вписывает в промпт метки времени кадров. Декодер не нужен (значение по
+    #   умолчанию);
+    # video  — окно режется ffmpeg в mp4 и отдаётся модели как файл: то же самое,
+    #   но декодирует его transformers, поэтому нужен torchcodec (или torchvision
+    #   с read_video) и библиотеки FFmpeg;
+    # frames — N отдельных картинок без видео-разметки (старый путь).
+    visual_indexer_qwen_input: str = "clip"
+    # Сколько секунд видео уходит в один запрос к qwen_video. 0 — как
+    # VISUAL_INDEXER_MAX_SCENE_SECONDS: один запрос = одна сцена. Больше —
+    # в один запрос пакуется несколько сцен, и модель отдаёт сегменты примерно
+    # по VISUAL_INDEXER_MAX_SCENE_SECONDS секунд каждый: запросов в разы меньше
+    # (а значит и времени), а длина описания остаётся той же. Меньше длины сцены
+    # значение не имеет смысла и поднимается до неё.
+    visual_indexer_qwen_request_seconds: float = 0.0
+    visual_indexer_florence_scene_threshold: float = 27.0
     visual_indexer_max_scene_seconds: float = 15.0
     # Максимальная высота кадра для визуальной индексации, в пикселях
-    # (0 = как в исходном видео). Кадры для florence / gemini уменьшаются до
-    # этой высоты перед отправкой в модель; для gemini_video в это разрешение
-    # перекодируется сам файл перед загрузкой в Gemini Files. Меньшая высота
-    # ускоряет загрузку и обработку облаком и сокращает число токенов в
-    # покадровом режиме (gemini), но не меняет токены в режиме целого видео
-    # (gemini_video) и почти не влияет на скорость Florence.
+    # (0 = как в исходном видео). Кадры для florence / qwen_video уменьшаются
+    # до этой высоты перед отправкой в модель; для gemini_video в это
+    # разрешение перекодируется сам файл перед загрузкой в Gemini Files.
+    # Меньшая высота сокращает число токенов у движков, отправляющих кадры
+    # картинками (qwen_video; у florence модель сама масштабирует кадр), и
+    # ускоряет загрузку и обработку целого файла (gemini_video).
     visual_indexer_max_height: int = 0
     # Кэш индекса визуала: результат индексации сохраняется рядом с видео
     # (``<video>.visual.json``) и переиспользуется на следующих запусках.
@@ -529,6 +556,7 @@ _STR_FIELDS = {
     "gemini_model",
     "visual_indexer_model",
     "visual_indexer_device",
+    "visual_indexer_qwen_quant",
     "whisper_model",
     "whisper_device",
     "whisper_language",
@@ -572,7 +600,6 @@ _INT_FIELDS = {
     "subtitle_shadow_offset_x",
     "subtitle_shadow_offset_y",
     "unique_crop",
-    "visual_indexer_batch_size",
     "visual_indexer_max_height",
     "llm_max_attempts",
 }
@@ -608,8 +635,10 @@ _FLOAT_FIELDS = {
     "unique_pitch",
     "unique_gain",
     "unique_jitter",
-    "visual_indexer_scene_threshold",
+    "visual_indexer_florence_scene_threshold",
     "visual_indexer_max_scene_seconds",
+    "visual_indexer_qwen_fps",
+    "visual_indexer_qwen_request_seconds",
     "llm_retry_backoff",
 }
 
@@ -652,6 +681,8 @@ def _coerce(field_name: str, raw: Any, current: Any) -> Any:
         return _as_choice(raw, key, str(current), VALID_BANNER_POSITIONS)
     if field_name == "visual_indexer_type":
         return _as_choice(raw, key, str(current), VALID_VISUAL_INDEXER_TYPES)
+    if field_name == "visual_indexer_qwen_input":
+        return _as_choice(raw, key, str(current), VALID_VISUAL_INDEXER_QWEN_INPUTS)
     return _as_str(raw, current)
 
 
@@ -811,10 +842,32 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("UNIQUE_GAIN must be between -20 and 20 dB")
     if not 0.0 <= settings.unique_jitter <= 1.0:
         raise ConfigError("UNIQUE_JITTER must be between 0 and 1")
-    if settings.visual_indexer_batch_size < 1:
-        raise ConfigError("VISUAL_INDEXER_BATCH_SIZE must be at least 1")
-    if settings.visual_indexer_scene_threshold <= 0:
-        raise ConfigError("VISUAL_INDEXER_SCENE_THRESHOLD must be greater than 0")
+    if settings.visual_indexer_qwen_fps <= 0:
+        raise ConfigError("VISUAL_INDEXER_QWEN_FPS must be greater than 0")
+    if settings.visual_indexer_qwen_request_seconds < 0:
+        raise ConfigError(
+            "VISUAL_INDEXER_QWEN_REQUEST_SECONDS must be zero (follow "
+            "VISUAL_INDEXER_MAX_SCENE_SECONDS) or greater"
+        )
+    if (settings.visual_indexer_qwen_quant or "").strip().lower() not in (
+        "",
+        "off",
+        "none",
+        "bnb4",
+        "4bit",
+        "int4",
+        "bnb8",
+        "8bit",
+        "int8",
+    ):
+        raise ConfigError(
+            "VISUAL_INDEXER_QWEN_QUANT must be one of off, bnb4, bnb8 "
+            f"(got {settings.visual_indexer_qwen_quant!r})"
+        )
+    if settings.visual_indexer_florence_scene_threshold <= 0:
+        raise ConfigError(
+            "VISUAL_INDEXER_FLORENCE_SCENE_THRESHOLD must be greater than 0"
+        )
     if settings.visual_indexer_max_scene_seconds <= 0:
         raise ConfigError("VISUAL_INDEXER_MAX_SCENE_SECONDS must be greater than 0")
     if settings.visual_indexer_max_height < 0:
@@ -856,7 +909,7 @@ def require_gemini_key(settings: Settings) -> str:
         raise RuntimeError(
             "GEMINI_API_KEY is not set. It is required when "
             "LLM_PROVIDER=gemini, or for the cloud visual indexer "
-            "(VISUAL_INDEXER_TYPE=gemini / gemini_video). Add it to your .env, "
+            "(VISUAL_INDEXER_TYPE=gemini_video). Add it to your .env, "
             "switch LLM_PROVIDER, or use VISUAL_INDEXER_TYPE=florence."
         )
     return settings.gemini_api_key
