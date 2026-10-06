@@ -776,6 +776,23 @@ def _print_shorts(result: Dict, enhanced: bool) -> None:
                 elif short.get("enhance_error"):
                     print(f"     enhance: FAILED ({short['enhance_error']})")
 
+    _print_failures(result)
+
+
+def _print_failures(result: Dict) -> None:
+    """List the source videos that failed while the rest of the run continued."""
+    failures = result.get("failures") or []
+    if not failures:
+        return
+    print("\n" + "-" * 72)
+    print(f"Failed videos: {len(failures)} (the rest were processed)")
+    for failure in failures:
+        source = failure.get("source_video_url")
+        print(
+            f"  - {os.path.basename(str(source)) if source else '?'}: {failure.get('error')}"
+        )
+    print("-" * 72)
+
 
 def _print_timing() -> None:
     """Print the per-stage wall-clock summary for the run, if any was recorded."""
@@ -785,12 +802,37 @@ def _print_timing() -> None:
     print("\n" + timer.report("Time spent"))
 
 
+def _exit_code_for(result: Dict) -> int:
+    """0 on a clean run, 1 when some videos failed but the rest completed.
+
+    Per-video failures no longer abort the whole run (see
+    ``pipeline._run``), so the sheet and clips from the sources that *did*
+    succeed are kept. The non-zero code keeps that partial failure visible to
+    scripts and shells without throwing the good output away.
+    """
+    failures = result.get("failures") or []
+    if failures:
+        print(
+            f"\n{len(failures)} video(s) failed; the clips and shorts_info from "
+            "the other inputs were kept.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def cmd_clip(settings: Settings, args: argparse.Namespace) -> int:
-    result = generate_shorts(settings)
+    # Write the shorts sheet after every video (not just at the end): if a later
+    # source aborts — exhausted LLM quota, bad audio, a broken cut — the clips
+    # already rendered earlier still get their info saved instead of losing it.
+    def _save_info(partial: Dict) -> None:
+        _write_shorts_info(partial, settings.output_dir)
+
+    result = generate_shorts(settings, on_video_done=_save_info)
     _print_shorts(result, enhanced=False)
     _write_shorts_info(result, settings.output_dir)
     _maybe_write_json(getattr(args, "output_json", None), result)
-    return 0
+    return _exit_code_for(result)
 
 
 def cmd_transcribe(settings: Settings, args: argparse.Namespace) -> int:
@@ -875,16 +917,23 @@ def cmd_subtitles(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_all(settings: Settings, args: argparse.Namespace) -> int:
+    # Same incremental write as ``clip``: the sheet is refreshed after each video
+    # so a failure partway through a batch does not cost the info of the shorts
+    # already rendered (and enhanced) before it.
+    def _save_info(partial: Dict) -> None:
+        _write_shorts_info(partial, settings.output_dir)
+
     result = generate_shorts(
         settings,
         enhance=True,
         add_music=getattr(args, "add_music", True),
         burn_subtitles=getattr(args, "add_subtitles", True),
+        on_video_done=_save_info,
     )
     _print_shorts(result, enhanced=True)
     _write_shorts_info(result, settings.output_dir)
     _maybe_write_json(getattr(args, "output_json", None), result)
-    return 0
+    return _exit_code_for(result)
 
 
 def cmd_preview(settings: Settings, args: argparse.Namespace) -> int:

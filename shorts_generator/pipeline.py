@@ -13,7 +13,7 @@ and burned-in subtitles to every rendered short (the ``all`` command).
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .clipper import crop_highlights
 from .config import Settings
@@ -217,11 +217,39 @@ def _process_one(
     }
 
 
+def _merge_result(
+    source_paths: List[str],
+    videos: List[Dict],
+    failures: List[Dict],
+) -> Dict:
+    """Assemble the merged result from the videos processed so far.
+
+    Shared by the final return value and by the incremental snapshots handed to
+    ``on_video_done`` after every source (a failed one included), so the caller
+    can persist partial progress — the ``shorts_info`` sheet — as the run goes
+    instead of waiting for the whole set to succeed.
+    """
+    single = len(videos) == 1
+    return {
+        "mode": "local",
+        "source_video_url": (
+            videos[0]["source_video_url"] if single else list(source_paths)
+        ),
+        "transcript": videos[0]["transcript"] if single else None,
+        "visuals": videos[0].get("visuals") if single else None,
+        "highlights": [h for v in videos for h in v["highlights"]],
+        "shorts": [s for v in videos for s in v["shorts"]],
+        "videos": videos,
+        "failures": failures,
+    }
+
+
 def _run(
     settings: Settings,
     enhance: bool = False,
     add_music: bool = True,
     burn_subtitles: bool = True,
+    on_video_done: Optional[Callable[[Dict], None]] = None,
 ) -> Dict:
     if not settings.input:
         raise RuntimeError("No input given. Set INPUT in .env or pass -i/--input.")
@@ -235,33 +263,45 @@ def _run(
         source_paths = resolve_input_videos(settings)
 
     videos: List[Dict] = []
+    failures: List[Dict] = []
     rendered = 0  # running total of shorts produced so far (all videos)
     for source_path in source_paths:
         if len(source_paths) > 1:
             print(f"[pipeline] video: {os.path.basename(source_path)}", flush=True)
-        video = _process_one(
-            source_path,
-            settings,
-            timer,
-            enhance=enhance,
-            add_music=add_music,
-            burn_subtitles=burn_subtitles,
-            start_index=rendered,
-        )
+        try:
+            video = _process_one(
+                source_path,
+                settings,
+                timer,
+                enhance=enhance,
+                add_music=add_music,
+                burn_subtitles=burn_subtitles,
+                start_index=rendered,
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad video must not sink the rest
+            # Isolate the failure: a single source (bad audio, exhausted LLM
+            # quota, a broken ffmpeg run) is recorded and the loop moves on to
+            # the next input. KeyboardInterrupt/SystemExit are BaseExceptions,
+            # so Ctrl+C still stops the whole run as usual.
+            detail = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[pipeline] video failed: {os.path.basename(source_path)} "
+                f"({detail}); continuing with the remaining inputs",
+                flush=True,
+            )
+            failures.append({"source_video_url": source_path, "error": detail})
+            # Still hand out what has been produced so far so partial results
+            # (and their clips) get saved even when a later video fails.
+            if on_video_done is not None:
+                on_video_done(_merge_result(source_paths, videos, failures))
+            continue
         rendered += len(video.get("shorts") or [])
         videos.append(video)
+        if on_video_done is not None:
+            on_video_done(_merge_result(source_paths, videos, failures))
 
-    single = len(videos) == 1
     return {
-        "mode": "local",
-        "source_video_url": (
-            videos[0]["source_video_url"] if single else list(source_paths)
-        ),
-        "transcript": videos[0]["transcript"] if single else None,
-        "visuals": videos[0].get("visuals") if single else None,
-        "highlights": [h for v in videos for h in v["highlights"]],
-        "shorts": [s for v in videos for s in v["shorts"]],
-        "videos": videos,
+        **_merge_result(source_paths, videos, failures),
         "timings": timer.as_dict(),
     }
 
@@ -272,6 +312,7 @@ def generate_shorts(
     *,
     add_music: bool = True,
     burn_subtitles: bool = True,
+    on_video_done: Optional[Callable[[Dict], None]] = None,
 ) -> Dict:
     """Run the full clipping pipeline and return a structured result.
 
@@ -288,6 +329,11 @@ def generate_shorts(
         add_music: with ``enhance``, mix in background music (default: on).
         burn_subtitles: with ``enhance``, burn subtitles into each short
             (default: on).
+        on_video_done: optional callback invoked after every source video is
+            processed (successful or failed) with the merged result assembled so
+            far. Lets a caller persist partial progress — e.g. write the
+            ``shorts_info`` sheet after each video — instead of losing it when a
+            later input aborts the run.
 
     Returns:
         {
@@ -302,6 +348,7 @@ def generate_shorts(
             ...
           ],
           "timings": {...},      # per-stage wall-clock measurements
+          "failures": [...],     # sources that failed (kept when the rest ran)
         }
     """
     return _run(
@@ -309,6 +356,7 @@ def generate_shorts(
         enhance=enhance,
         add_music=add_music,
         burn_subtitles=burn_subtitles,
+        on_video_done=on_video_done,
     )
 
 
