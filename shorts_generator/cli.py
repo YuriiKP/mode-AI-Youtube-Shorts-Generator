@@ -1,6 +1,7 @@
 """Unified command-line interface — one entry point for the whole project.
 
     python main.py clip        # long video -> ranked vertical shorts
+    python main.py montage     # one video -> one stitched hook clip
     python main.py transcribe  # Whisper -> .srt subtitles
     python main.py music       # add background music
     python main.py subtitles   # burn subtitles in
@@ -19,7 +20,12 @@ import sys
 from typing import Dict, List, Optional, Sequence
 
 from .config import ConfigError, Settings, load_settings
-from .pipeline import generate_shorts, generate_subtitles, resolve_input_videos
+from .pipeline import (
+    generate_montage,
+    generate_shorts,
+    generate_subtitles,
+    resolve_input_videos,
+)
 from .postprocess.log import setup_logging
 from .timing import get_timer, start_timer
 
@@ -28,6 +34,7 @@ examples:
   python main.py clip                       # uses INPUT / OUTPUT_DIR from .env
   python main.py clip -i "video/talk.mkv" -n 5
   python main.py clip --slide --slide-transition-gap 3   # slide crop across cuts
+  python main.py montage -i "video/talk.mkv"   # one stitched 50-90s hook clip
   python main.py transcribe                 # writes <video>.srt next to the video
   python main.py music -m music/            # random track from a folder
   python main.py music -m song.mp3          # one specific track
@@ -468,6 +475,41 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(clip)
     _add_common(clip)
 
+    # montage ---------------------------------------------------------------
+    montage = sub.add_parser(
+        "montage",
+        help="stitch the most dynamic connected moments into one hook clip",
+        description=(
+            "Pick the most dynamic, semantically connected moments of the source "
+            "and cut + join them into one vertical hook clip (~50-90s), then add "
+            "music and subtitles. The montage length and per-segment bounds are "
+            "hardcoded next to the prompt in montage.py, not configurable here."
+        ),
+    )
+    _add_io(montage)
+    # Reused for the transcription-side flags (language, download format,
+    # visual indexing): the per-clip ranking/crop flags are accepted for
+    # consistency with ``clip`` but ignored by the montage path.
+    _add_clip_options(montage)
+    _add_render_options(montage)
+    _add_uniqueness_options(montage)
+    montage.add_argument(
+        "--music-enabled",
+        dest="add_music",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="add background music to the montage (default: on)",
+    )
+    montage.add_argument(
+        "--subtitles-enabled",
+        dest="add_subtitles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="burn subtitles into the montage (default: on)",
+    )
+    _add_json(montage)
+    _add_common(montage)
+
     # transcribe ------------------------------------------------------------
     transcribe = sub.add_parser(
         "transcribe",
@@ -828,8 +870,41 @@ def cmd_clip(settings: Settings, args: argparse.Namespace) -> int:
     def _save_info(partial: Dict) -> None:
         _write_shorts_info(partial, settings.output_dir)
 
+    # MONTAGE_MODE=true switches ``clip`` to the montage pipeline: one long video
+    # becomes a single stitched hook clip instead of several separate shorts.
+    # No enhance here — ``clip`` never adds music or burned-in subtitles.
+    if getattr(settings, "montage_mode", False):
+        print(
+            "[clip] MONTAGE_MODE is on — routing to the montage pipeline",
+            flush=True,
+        )
+        result = generate_montage(settings, enhance=False, on_video_done=_save_info)
+        _print_shorts(result, enhanced=False)
+        _write_shorts_info(result, settings.output_dir)
+        _maybe_write_json(getattr(args, "output_json", None), result)
+        return _exit_code_for(result)
+
     result = generate_shorts(settings, on_video_done=_save_info)
     _print_shorts(result, enhanced=False)
+    _write_shorts_info(result, settings.output_dir)
+    _maybe_write_json(getattr(args, "output_json", None), result)
+    return _exit_code_for(result)
+
+
+def cmd_montage(settings: Settings, args: argparse.Namespace) -> int:
+    # Same incremental write as ``clip``/``all``: the info sheet is refreshed
+    # after each video so a later failure does not cost the info already saved.
+    def _save_info(partial: Dict) -> None:
+        _write_shorts_info(partial, settings.output_dir)
+
+    result = generate_montage(
+        settings,
+        enhance=True,
+        add_music=getattr(args, "add_music", True),
+        burn_subtitles=getattr(args, "add_subtitles", True),
+        on_video_done=_save_info,
+    )
+    _print_shorts(result, enhanced=True)
     _write_shorts_info(result, settings.output_dir)
     _maybe_write_json(getattr(args, "output_json", None), result)
     return _exit_code_for(result)
@@ -923,6 +998,26 @@ def cmd_all(settings: Settings, args: argparse.Namespace) -> int:
     def _save_info(partial: Dict) -> None:
         _write_shorts_info(partial, settings.output_dir)
 
+    # MONTAGE_MODE=true switches ``all`` to the montage pipeline as well, keeping
+    # the music/subtitle stages that ``all`` normally runs: one long video
+    # becomes a single stitched hook clip instead of several separate shorts.
+    if getattr(settings, "montage_mode", False):
+        print(
+            "[all] MONTAGE_MODE is on — routing to the montage pipeline",
+            flush=True,
+        )
+        result = generate_montage(
+            settings,
+            enhance=True,
+            add_music=getattr(args, "add_music", True),
+            burn_subtitles=getattr(args, "add_subtitles", True),
+            on_video_done=_save_info,
+        )
+        _print_shorts(result, enhanced=True)
+        _write_shorts_info(result, settings.output_dir)
+        _maybe_write_json(getattr(args, "output_json", None), result)
+        return _exit_code_for(result)
+
     result = generate_shorts(
         settings,
         enhance=True,
@@ -963,6 +1058,7 @@ def cmd_publish(settings: Settings, args: argparse.Namespace) -> int:
 
 _COMMANDS = {
     "clip": cmd_clip,
+    "montage": cmd_montage,
     "transcribe": cmd_transcribe,
     "music": cmd_music,
     "subtitles": cmd_subtitles,

@@ -255,6 +255,50 @@ def _reframe_vertical(
     return out_path
 
 
+def reframe_video(
+    in_path: str,
+    out_path: str,
+    aspect_ratio: str = "9:16",
+    *,
+    face_tracking: bool = True,
+    slide_effect: bool = False,
+    slide_gap: float = 3.0,
+    slide_range: float = 1.0,
+) -> str:
+    """Reframe an already-built video to ``aspect_ratio``, without re-cutting.
+
+    This is the *crop* step of the pipeline — the same OpenCV pass ``crop_clip``
+    runs — applied to a video that is already a single, finished file rather than
+    to a time window of a source: nothing is seeked or cut, every frame of
+    ``in_path`` is re-framed and the audio is carried over (see
+    :func:`_reframe_vertical`). The caller keeps the file's timeline untouched,
+    which is what lets timings computed for the input still line up after the
+    call — subtitles and music therefore stay in sync.
+
+    The montage pipeline uses it right after stitching its segments: those come
+    out in the source aspect ratio, so the stitched file still has to be cut to
+    the target shape before the rest of the pipeline (vertical fit, colour/lens
+    effects, uniqueness, music, subtitles) runs, exactly as a highlight is
+    cropped before it is enhanced.
+
+    Unlike the private helper it wraps, the output path is required and the
+    ``.silent.mp4`` intermediate is handled internally, so this is the intended
+    entry point for callers outside this module.
+
+    Returns:
+        ``out_path`` — the reframed video, matching ``aspect_ratio``.
+    """
+    return _reframe_vertical(
+        in_path,
+        out_path,
+        aspect_ratio,
+        face_tracking=face_tracking,
+        slide_effect=slide_effect,
+        slide_gap=slide_gap,
+        slide_range=slide_range,
+    )
+
+
 def crop_clip(
     source_path: str,
     start_time: float,
