@@ -30,8 +30,10 @@ pipeline keeps working when visual indexing is switched off.
 
 from __future__ import annotations
 
+import io
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -291,6 +293,168 @@ def _probe_dimensions(video_path: str) -> Tuple[int, int]:
         return width, height
     except Exception:
         return 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Upload progress (gemini_video engine)
+# ---------------------------------------------------------------------------
+
+
+class _LiveLine:
+    """A status line that is rewritten in place when stdout is a terminal.
+
+    The Gemini upload offers no progress callback, so the only feedback is what
+    we print ourselves. On a terminal the text is redrawn with a carriage
+    return; when stdout is redirected to a file (a long unattended run) that
+    would turn into thousands of lines, so it falls back to emitting one line
+    every ``_MIN_INTERVAL`` seconds.
+    """
+
+    _MIN_INTERVAL: float = 10.0
+
+    def __init__(self) -> None:
+        self._tty: bool = sys.stdout.isatty()
+        self._last: float = 0.0
+
+    def render(self, text: str) -> None:
+        """Draw ``text`` (throttled when stdout is not a terminal)."""
+        if self._tty:
+            print("\r" + text, end="", flush=True)
+            return
+        now = time.time()
+        if now - self._last >= self._MIN_INTERVAL:
+            self._last = now
+            print(text, flush=True)
+
+    def done(self, text: str) -> None:
+        """Draw the final ``text`` and move on to a fresh line."""
+        if self._tty:
+            print("\r" + text, flush=True)
+        else:
+            print(text, flush=True)
+
+
+class _UploadProgress:
+    """Byte bar fed by :class:`_ProgressReader` and drawn through ``_LiveLine``."""
+
+    _WIDTH: int = 30
+
+    def __init__(self, label: str, total: int, line: _LiveLine) -> None:
+        self._label: str = label
+        self._total: int = max(int(total), 0)
+        self._done: int = 0
+        self._start: float = time.time()
+        self._line: _LiveLine = line
+
+    def advance(self, count: int) -> None:
+        """Record ``count`` freshly sent bytes and redraw the bar."""
+        self._done += count
+        self._line.render(self._text(self._percent()))
+
+    def finish(self) -> None:
+        """Draw the final bar, at the percentage actually reached.
+
+        After a clean transfer ``_done`` equals ``_total`` so this reads 100%;
+        rendering the real value (rather than forcing 100) keeps the line honest
+        if the uploader ever stops short.
+        """
+        self._line.done(self._text(self._percent()))
+
+    def fail(self) -> None:
+        """End the line where the transfer stopped, without claiming 100%."""
+        self._line.done(self._text(self._percent()) + "  aborted")
+
+    def _percent(self) -> int:
+        if self._total <= 0:
+            return 100
+        return min(100, self._done * 100 // self._total)
+
+    def _text(self, percent: int) -> str:
+        filled = self._WIDTH * percent // 100
+        bar = "#" * filled + "-" * (self._WIDTH - filled)
+        elapsed = max(time.time() - self._start, 1e-6)
+        mb = 1024 * 1024
+        return (
+            f"[visual] {self._label}  [{bar}] {percent:3d}%  "
+            f"{self._done / mb:.1f}/{self._total / mb:.1f} MB  "
+            f"{self._done / elapsed / mb:.1f} MB/s"
+        )
+
+
+class _ProgressReader(io.IOBase):
+    """File wrapper that advances a bar as the uploader reads the file.
+
+    ``google-genai``'s ``Files.upload`` exposes no progress hook, but it accepts
+    an ``io.IOBase`` and streams it in ``CHUNK_SIZE`` (8 MiB) reads — that read
+    loop is the one place an upload can be observed. Delegating to the real
+    handle and counting the bytes on the way through gives a dependency-free,
+    crash-proof bar without reaching into the SDK's private internals. The step
+    is one SDK chunk, so the bar moves in 8 MiB jumps.
+    """
+
+    # The SDK rejects a wrapper whose ``mode`` is not binary.
+    mode: str = "rb"
+
+    def __init__(self, handle: io.BufferedReader, bar: _UploadProgress) -> None:
+        self._handle: io.BufferedReader = handle
+        self._bar: _UploadProgress = bar
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._handle.read(size)
+        if chunk:
+            self._bar.advance(len(chunk))
+        return chunk
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._handle.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._handle.tell()
+
+    def fileno(self) -> int:
+        return self._handle.fileno()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        # The uploader may close whatever it was handed; the real handle is
+        # owned by the ``with`` block that opened it, so closing this wrapper
+        # (including the implicit close on garbage collection) must do nothing.
+        pass
+
+
+# Extensions the Files API accepts, used only when ``mimetypes`` cannot guess.
+_VIDEO_MIME_TYPES = {
+    ".3gp": "video/3gpp",
+    ".avi": "video/x-msvideo",
+    ".flv": "video/x-flv",
+    ".m4v": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".webm": "video/webm",
+    ".wmv": "video/x-ms-wmv",
+}
+
+
+def _video_mime_type(path: str) -> str:
+    """MIME type for a Files API upload sent as a stream.
+
+    Only needed for the progress wrapper: given a plain path the SDK guesses
+    this itself, but an ``io.IOBase`` carries no name. An extension neither
+    ``mimetypes`` nor the table knows falls back to ``video/mp4`` rather than
+    failing the upload outright.
+    """
+    guessed, _ = mimetypes.guess_type(path)
+    if guessed:
+        return guessed
+    return _VIDEO_MIME_TYPES.get(os.path.splitext(path)[1].lower(), "video/mp4")
 
 
 def _downscale_for_upload(
@@ -1643,31 +1807,79 @@ class GeminiVideoIndexer(BaseVisualIndexer):
         )
         upload_path, cleanup_dir = _ascii_upload_path(scaled_path)
         try:
-            size = os.path.getsize(upload_path)
+            video_file = self._upload_file(client, upload_path)
+            video_file = self._await_processing(client, video_file)
+            state = _file_state(video_file)
+            if state == "FAILED":
+                raise RuntimeError("Gemini failed to process the uploaded video")
             print(
-                f"[visual] uploading {os.path.basename(self.video_path)} to Gemini "
-                f"Files ({size / (1024 * 1024):.1f} MB)",
+                f"[visual] video uploaded and processed (state={state})",
                 flush=True,
             )
-            video_file = client.files.upload(file=upload_path)
-            deadline = time.time() + GEMINI_UPLOAD_TIMEOUT_SECONDS
-            state = _file_state(video_file)
-            while state == "PROCESSING":
-                if time.time() > deadline:
-                    raise RuntimeError(
-                        "Gemini timed out while processing the uploaded video"
-                    )
-                time.sleep(GEMINI_VIDEO_POLL_SECONDS)
-                video_file = client.files.get(name=video_file.name)
-                state = _file_state(video_file)
+            return video_file
         finally:
             if cleanup_dir:
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
             if scale_dir:
                 shutil.rmtree(scale_dir, ignore_errors=True)
-        if state == "FAILED":
-            raise RuntimeError("Gemini failed to process the uploaded video")
-        print(f"[visual] video uploaded and processed (state={state})", flush=True)
+
+    def _upload_file(self, client, upload_path: str):
+        """Stream ``upload_path`` to the Files API while a byte bar runs.
+
+        ``Files.upload`` has no progress callback, but it accepts an
+        ``io.IOBase`` and reads it in ``CHUNK_SIZE`` chunks, so wrapping the
+        open handle turns those reads into the bar (see :class:`_ProgressReader`).
+        The wrapper carries no name, so the mime type has to be passed in — with
+        a plain path the SDK would guess it.
+        """
+        total = os.path.getsize(upload_path)
+        bar = _UploadProgress(
+            f"uploading {os.path.basename(self.video_path)} to Gemini Files",
+            total,
+            _LiveLine(),
+        )
+        try:
+            with open(upload_path, "rb") as handle:
+                video_file = client.files.upload(
+                    file=_ProgressReader(handle, bar),
+                    config={"mime_type": _video_mime_type(upload_path)},
+                )
+        except BaseException:
+            # Don't leave the bar finishing at 100% when the transfer died.
+            bar.fail()
+            raise
+        bar.finish()
+        return video_file
+
+    def _await_processing(self, client, video_file):
+        """Block until Gemini finishes transcoding the upload, showing a clock.
+
+        Gemini reports only ``PROCESSING``/``ACTIVE``/``FAILED`` for an uploaded
+        video and no percentage, so this wait can only be shown as a running
+        timed line rather than a real progress bar.
+        """
+        state = _file_state(video_file)
+        if state != "PROCESSING":
+            return video_file
+        deadline = time.time() + GEMINI_UPLOAD_TIMEOUT_SECONDS
+        started = time.time()
+        status = _LiveLine()
+        while state == "PROCESSING":
+            if time.time() > deadline:
+                raise RuntimeError(
+                    "Gemini timed out while processing the uploaded video"
+                )
+            status.render(
+                f"[visual] Gemini is processing the uploaded video… "
+                f"{time.time() - started:.0f}s"
+            )
+            time.sleep(GEMINI_VIDEO_POLL_SECONDS)
+            video_file = client.files.get(name=video_file.name)
+            state = _file_state(video_file)
+        elapsed = time.time() - started
+        status.done(
+            f"[visual] Gemini processing finished after {elapsed:.0f}s (state={state})"
+        )
         return video_file
 
     def _delete(self, client, video_file) -> None:
