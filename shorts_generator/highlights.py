@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .config import Settings
 from .cues import phrase_boundaries
 from .llm import call_llm
+from .provider_errors import RunFatalError
 from .visual_indexer import format_merged_log, merge_transcripts_and_visuals
 
 LLMFn = Callable[[str], str]
@@ -66,6 +67,19 @@ HIGHLIGHT_SYSTEM_PROMPT = """
 # Этап 1: только тайминги, оценка и причина. Метаданные (заголовок, описание,
 # теги, метрики) здесь не запрашиваются — вывод короче, attention модели не
 # распылён между «математикой» границ и креативом, а риск обрезать JSON падает.
+
+# - В логе КАЖДАЯ реплика помечена своим интервалом [начало - конец] в секундах. Значения start_time и end_time бери РОВНО из границ выбранных реплик: start_time — начало реплики-хука, end_time — конец реплики-панчлайна. Не округляй до соседних строк и не бери окно целиком.
+# - В окно клипа должны попасть ТОЛЬКО реплики от хука до панчлайна. Не захватывай реплику ПЕРЕД хуком и реплику ПОСЛЕ панчлайна — именно из-за них в клип залезают соседние сцены.
+# - Начинай клип ровно на хуке и заканчивай ровно на панчлайне. Не тяни разгон, контекст и продолжение «на всякий случай».
+# - Предпочтительная длительность: 50–90 секунд.
+# - Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным.
+# - Клипы не должны существенно пересекаться друг с другом.
+# - Бесшовность (Loop): по возможности выводи финал обратно к началу.
+# - Оценка 0-100 по виральному потенциалу (а не по общему качеству).
+# - {num_clips_instruction}
+# - Укажи "clip_type" — короткий тип момента (например: shock, conflict, reveal, joke, emotional).
+# - Объясни одним предложением, почему этот клип виральный ("virality_reason").
+
 TIMING_SYSTEM_PROMPT = """Ты элитный редактор коротких вертикальных видео, изучивший тысячи вирусных клипов в TikTok, Instagram Reels и YouTube Shorts. Ты точно знаешь, что заставляет зрителей прекратить листать, досматривать до конца и делиться.
 
 {virality_criteria}
@@ -77,17 +91,11 @@ TIMING_SYSTEM_PROMPT = """Ты элитный редактор коротких 
 Твоя задача: определить самые виральные моменты (хайлайты) в логе видео и указать ТОЛЬКО их точные границы и оценку. Никаких заголовков, описаний и хэштегов здесь не нужно — это отдельный шаг.
 
 Правила:
-- В логе КАЖДАЯ реплика помечена своим интервалом [начало - конец] в секундах. Значения start_time и end_time бери РОВНО из границ выбранных реплик: start_time — начало реплики-хука, end_time — конец реплики-панчлайна. Не округляй до соседних строк и не бери окно целиком.
-- В окно клипа должны попасть ТОЛЬКО реплики от хука до панчлайна. Не захватывай реплику ПЕРЕД хуком и реплику ПОСЛЕ панчлайна — именно из-за них в клип залезают соседние сцены.
-- Начинай клип ровно на хуке и заканчивай ровно на панчлайне. Не тяни разгон, контекст и продолжение «на всякий случай».
-- Предпочтительная длительность: 50–90 секунд.
-- Никогда не обрезай посреди предложения или мысли — каждый клип должен ощущаться завершённым и самодостаточным.
-- Клипы не должны существенно пересекаться друг с другом.
-- Бесшовность (Loop): по возможности выводи финал обратно к началу.
-- Оценка 0-100 по виральному потенциалу (а не по общему качеству).
-- {num_clips_instruction}
-- Укажи "clip_type" — короткий тип момента (например: shock, conflict, reveal, joke, emotional).
-- Объясни одним предложением, почему этот клип виральный ("virality_reason").
+1. Длительность: 50–90 секунд.
+2. Границы клипа: Начинай ровно с хука и заканчивай чётким панчлайном. Бери точные значения start_time и end_time из лога [начало - конец].
+3. Изолированность: Хайлайты не должны пересекаться и не должны стоять впритык друг к другу. Выбирай только лучшие моменты с паузами между ними.
+4. Оценка 0-100 по виральному потенциалу.
+5. {num_clips_instruction}
 
 Отвечай ТОЛЬКО валидным JSON (без markdown, без пояснений):
 {{"content_type":"string","density":"string","highlights":[{{"clip_type":"string","start_time":float,"end_time":float,"score":int,"virality_reason":"string"}}]}}"""
@@ -592,6 +600,14 @@ def enrich_highlights_metadata(
     call = llm_fn or (lambda p: call_llm(p, settings))
     try:
         parsed = _parse_json_loose(call(prompt))
+    except RunFatalError:
+        # "Best-effort" covers a bad *answer* — unparsable JSON, a wrong shape,
+        # a missing field. It does not cover a provider that cannot answer at
+        # all: a spent quota or a rejected key refuses the next video exactly
+        # the same way, so it is surfaced (and, being a ``RunFatalError``, stops
+        # the batch) instead of quietly handing the remaining videos default
+        # titles while the run looks successful.
+        raise
     except Exception as exc:  # noqa: BLE001 - metadata is best-effort
         print(
             f"[highlights] stage-2 metadata failed "

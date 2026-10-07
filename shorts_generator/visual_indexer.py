@@ -45,6 +45,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .config import ConfigError, Settings, require_gemini_key
+from .provider_errors import (
+    RunFatalError,
+    is_quota_exhausted,
+    is_retryable_provider_error,
+    provider_error,
+)
 from .timing import time_stage
 
 __all__ = [
@@ -746,8 +752,13 @@ def _split_long_scenes(
 # ---------------------------------------------------------------------------
 
 
-class VisualIndexerSetupError(RuntimeError):
-    """The selected visual-indexing engine cannot run as configured."""
+class VisualIndexerSetupError(RunFatalError):
+    """The selected visual-indexing engine cannot run as configured.
+
+    ``RunFatalError``, not a plain ``RuntimeError``: a missing dependency or API
+    key is not a property of the current video, so every remaining input would
+    fail on it identically and the batch is stopped at the first one.
+    """
 
 
 def _install_hint(packages: str) -> str:
@@ -907,102 +918,10 @@ def _qwen_video_backend_message(exc: Optional[BaseException] = None) -> str:
 # rejected key, a malformed request) is reported at once instead of being
 # retried through the whole backoff — which is what hid a 404 "model no longer
 # available" behind a "gave up" line and let the run continue without visuals.
+# The classification itself lives in ``provider_errors.py`` (``llm.py`` needs
+# exactly the same rules) and the errors it raises are ``RunFatalError``s, which
+# stop the batch instead of being repeated for every remaining input.
 # ---------------------------------------------------------------------------
-
-# HTTP statuses worth retrying: request timeout, conflict and "too many
-# requests". Any other 4xx is permanent; 5xx is transient overload.
-_RETRYABLE_HTTP_STATUS = frozenset({408, 409, 429})
-
-# Message-level fallback for SDKs that expose no usable status code.
-_RETRYABLE_ERROR_MARKERS = (
-    "resource_exhausted",
-    "resource exhausted",
-    "unavailable",
-    "overloaded",
-    "high demand",
-    "rate limit",
-    "rate_limit",
-    "too many requests",
-    "timed out",
-    "timeout",
-    "deadline",
-    "temporarily",
-    "try again",
-)
-
-# The "404 NOT_FOUND." / "503 UNAVAILABLE." prefix google-genai puts in str(exc).
-_STATUS_IN_MESSAGE_RE = re.compile(r"\b([1-5]\d{2})\b\s+[A-Z][A-Z_]{2,}")
-
-
-def _provider_http_status(exc: Exception) -> Optional[int]:
-    """Best-effort HTTP status behind a provider exception, else ``None``.
-
-    ``google-genai`` (and google-api-core) expose it as ``.code``; some SDKs use
-    ``.status_code``. When neither is set the ``"404 NOT_FOUND. …"`` prefix of
-    the message is parsed as a last resort.
-    """
-    for attr in ("code", "status_code"):
-        value = getattr(exc, attr, None)
-        if value is None or isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            if 100 <= value <= 599:
-                return value
-            continue
-        match = re.search(r"\b([1-5]\d{2})\b", str(value))
-        if match:
-            return int(match.group(1))
-    match = _STATUS_IN_MESSAGE_RE.search(str(exc))
-    return int(match.group(1)) if match else None
-
-
-def _is_retryable_provider_error(exc: Exception) -> bool:
-    """True only for errors a second attempt can plausibly fix.
-
-    4xx other than 408/409/429 (a retired model name, a bad key, a malformed
-    request) are permanent: they are surfaced immediately instead of being
-    retried, so the real cause is not masked as a transient network blip.
-    """
-    status = _provider_http_status(exc)
-    if status is not None:
-        return status in _RETRYABLE_HTTP_STATUS or status >= 500
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
-
-
-def _non_retryable_error(
-    engine: str,
-    model: str,
-    exc: Exception,
-    *,
-    key_env: str = "GEMINI_API_KEY",
-    model_env: str = "GEMINI_MODEL",
-) -> RuntimeError:
-    """Turn a permanent provider error into a clear, actionable ``RuntimeError``.
-
-    ``key_env`` / ``model_env`` name the ``.env`` variables the caller's engine
-    reads, so the fix-it hint points at the right key for Gemini and Qwen alike.
-    """
-    status = _provider_http_status(exc)
-    what = f"HTTP {status}" if status is not None else "non-retryable error"
-    message = f"{engine} request failed with a {what} that retrying cannot fix: {exc}"
-    text = str(exc).lower()
-    if status in (401, 403) or "api key" in text or "permission" in text:
-        message += (
-            f"\nCheck {key_env} in .env — the key looks rejected or lacks "
-            "access to this API."
-        )
-    elif status == 404 or "not found" in text or "no longer available" in text:
-        message += (
-            f"\nThe model {model!r} ({model_env} in .env) is not available to "
-            f"this key — it may be retired or renamed. Update {model_env} and "
-            "re-run."
-        )
-    elif status == 400:
-        message += (
-            f"\nThe request was rejected as malformed; check {model_env} ({model!r})."
-        )
-    return RuntimeError(message)
 
 
 # ---------------------------------------------------------------------------
@@ -1438,7 +1357,9 @@ def index_video(
     # A missing dependency or an invalid configuration is deterministic: fail
     # now, before scene detection spends minutes scanning the whole video, and
     # point at the fix, instead of continuing without the visuals that
-    # VISUAL_INDEXER_ENABLED=true asked for.
+    # VISUAL_INDEXER_ENABLED=true asked for. ``preflight`` raises a
+    # ``RunFatalError``, so the batch stops here rather than repeating the same
+    # deterministic failure (and the same scan) for every remaining input.
     indexer.preflight()
 
     if scenes is None:
@@ -1473,16 +1394,24 @@ def index_video(
             result = indexer.index(windows)
     except VisualIndexerSetupError:
         # Deterministic setup problem (missing dependency / key): re-raise with
-        # the fix-it hint rather than swallowing it.
+        # the fix-it hint rather than swallowing it — and as a ``RunFatalError``,
+        # so the batch stops instead of failing this way once per input.
         raise
     except Exception as exc:
-        raise RuntimeError(
+        message = (
             "visual indexing is enabled (VISUAL_INDEXER_ENABLED=true, "
             f"VISUAL_INDEXER_TYPE={indexer.name}) but failed "
             f"({type(exc).__name__}: {exc}).\n"
             "Fix the cause above and re-run, or set "
             "VISUAL_INDEXER_ENABLED=false to continue without visual context."
-        ) from exc
+        )
+        # Keep the class: a provider-side failure (spent quota, rejected key,
+        # retired model) is wrapped in ``RunFatalError`` so ``pipeline._run``
+        # stops the batch on it instead of walking the remaining inputs into the
+        # same wall. A per-video failure stays a plain ``RuntimeError``, which the
+        # pipeline isolates and carries on from.
+        error_type = RunFatalError if isinstance(exc, RunFatalError) else RuntimeError
+        raise error_type(message) from exc
 
     described = [
         scene
@@ -1937,9 +1866,13 @@ class GeminiVideoIndexer(BaseVisualIndexer):
                 last_error = exc
                 # A permanent error (retired model name, rejected key, malformed
                 # request) fails identically on every attempt: stop now with the
-                # real cause instead of hiding it behind the backoff.
-                if not _is_retryable_provider_error(exc):
-                    raise _non_retryable_error("Gemini video", model, exc) from exc
+                # real cause instead of hiding it behind the backoff. A spent
+                # quota is the same case for a different reason: the provider
+                # answers "retry in 3h24m" in its own body, and no 2-4-8-16s
+                # backoff outlasts that — sleeping through it only prints the
+                # same 429 five times before failing anyway.
+                if is_quota_exhausted(exc) or not is_retryable_provider_error(exc):
+                    raise provider_error("gemini_video", model, exc) from exc
                 print(
                     f"[visual] gemini video request failed "
                     f"({type(exc).__name__}: {exc}) "
@@ -1951,10 +1884,11 @@ class GeminiVideoIndexer(BaseVisualIndexer):
 
         # Transient errors exhausted every attempt: surface them instead of
         # returning an empty index, so an enabled indexer either contributes or
-        # stops the run (index_video adds the fix-it hint).
-        raise RuntimeError(
-            f"Gemini video request failed after {attempts} attempt(s) "
-            f"({type(last_error).__name__}: {last_error})"
+        # stops the run (index_video adds the fix-it hint). ``provider_error``
+        # also spells out the provider's own retry hint and the .env knobs that
+        # would unblock the next attempt.
+        raise provider_error(
+            "gemini_video", model, last_error, attempts=attempts
         ) from last_error
 
     def _parse_timeline(self, raw: str, duration: float) -> List[Dict[str, Any]]:

@@ -33,6 +33,7 @@ from .montage import (
     generate_montage_metadata,
     select_montage_segments,
 )
+from .provider_errors import RunFatalError
 from .subtitles import find_video_files
 from .timing import start_timer
 from .transcriber import transcribe
@@ -404,7 +405,7 @@ def _run_montage(
     videos: List[Dict] = []
     failures: List[Dict] = []
     rendered = 0  # running total of montage clips produced so far
-    for source_path in source_paths:
+    for index, source_path in enumerate(source_paths):
         if len(source_paths) > 1:
             print(f"[pipeline] video: {os.path.basename(source_path)}", flush=True)
         try:
@@ -417,7 +418,37 @@ def _run_montage(
                 burn_subtitles=burn_subtitles,
                 start_index=rendered,
             )
+        except RunFatalError as exc:
+            # Not about this video: the provider is refusing every request the
+            # same way (a spent daily quota, a rejected key, a retired model, an
+            # overload that outlived every retry). Every remaining input would
+            # first pay for its own Whisper pass, scene scan and upload — and
+            # only then walk into exactly this wall. Stop at the first one
+            # instead, with a single message rather than one copy per input.
+            detail = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[pipeline] video failed: {os.path.basename(source_path)} ({detail})",
+                flush=True,
+            )
+            remaining = len(source_paths) - index - 1
+            print(
+                "[pipeline] stopping the batch: this failure is provider-side and "
+                f"not about this video, so the {remaining} remaining input(s) were "
+                "left untouched. Fix the cause above and re-run — the Whisper "
+                "transcripts already on disk are reused.",
+                flush=True,
+            )
+            failures.append(
+                {"source_video_url": source_path, "error": detail, "fatal": True}
+            )
+            if on_video_done is not None:
+                on_video_done(_merge_result(source_paths, videos, failures))
+            break
         except Exception as exc:  # noqa: BLE001 - one bad video must not sink the rest
+            # Isolate the failure: a single source (bad audio, a broken ffmpeg
+            # run, a window with no usable material) is recorded and the loop
+            # moves on to the next input. KeyboardInterrupt/SystemExit are
+            # BaseExceptions, so Ctrl+C still stops the whole run as usual.
             detail = f"{type(exc).__name__}: {exc}"
             print(
                 f"[pipeline] video failed: {os.path.basename(source_path)} "
@@ -452,6 +483,10 @@ def _merge_result(
     instead of waiting for the whole set to succeed.
     """
     single = len(videos) == 1
+    # ``fatal`` marks the failure that stopped the batch early (see ``_run``):
+    # it is how the CLI tells a run that gave up on the remaining inputs from
+    # one that carried on past a per-video problem and processed them all.
+    fatal = [f for f in failures if f.get("fatal")]
     return {
         "mode": "local",
         "source_video_url": (
@@ -463,6 +498,8 @@ def _merge_result(
         "shorts": [s for v in videos for s in v["shorts"]],
         "videos": videos,
         "failures": failures,
+        "aborted": bool(fatal),
+        "abort_reason": fatal[-1]["error"] if fatal else None,
     }
 
 
@@ -487,7 +524,7 @@ def _run(
     videos: List[Dict] = []
     failures: List[Dict] = []
     rendered = 0  # running total of shorts produced so far (all videos)
-    for source_path in source_paths:
+    for index, source_path in enumerate(source_paths):
         if len(source_paths) > 1:
             print(f"[pipeline] video: {os.path.basename(source_path)}", flush=True)
         try:
@@ -500,11 +537,39 @@ def _run(
                 burn_subtitles=burn_subtitles,
                 start_index=rendered,
             )
+        except RunFatalError as exc:
+            # Not about this video: the provider is refusing every request the
+            # same way (a spent daily quota, a rejected key, a retired model, an
+            # overload that outlived every retry). Every remaining input would
+            # first pay for its own Whisper pass, scene scan and upload — and
+            # only then walk into exactly this wall. Stop at the first one
+            # instead, with a single message rather than one copy per input.
+            detail = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[pipeline] video failed: {os.path.basename(source_path)} ({detail})",
+                flush=True,
+            )
+            remaining = len(source_paths) - index - 1
+            print(
+                "[pipeline] stopping the batch: this failure is provider-side and "
+                f"not about this video, so the {remaining} remaining input(s) were "
+                "left untouched. Fix the cause above and re-run — the Whisper "
+                "transcripts already on disk are reused.",
+                flush=True,
+            )
+            failures.append(
+                {"source_video_url": source_path, "error": detail, "fatal": True}
+            )
+            # Still hand out what has been produced so far so partial results
+            # (and their clips) get saved even when the batch stops here.
+            if on_video_done is not None:
+                on_video_done(_merge_result(source_paths, videos, failures))
+            break
         except Exception as exc:  # noqa: BLE001 - one bad video must not sink the rest
-            # Isolate the failure: a single source (bad audio, exhausted LLM
-            # quota, a broken ffmpeg run) is recorded and the loop moves on to
-            # the next input. KeyboardInterrupt/SystemExit are BaseExceptions,
-            # so Ctrl+C still stops the whole run as usual.
+            # Isolate the failure: a single source (bad audio, a broken ffmpeg
+            # run, a window with no usable material) is recorded and the loop
+            # moves on to the next input. KeyboardInterrupt/SystemExit are
+            # BaseExceptions, so Ctrl+C still stops the whole run as usual.
             detail = f"{type(exc).__name__}: {exc}"
             print(
                 f"[pipeline] video failed: {os.path.basename(source_path)} "

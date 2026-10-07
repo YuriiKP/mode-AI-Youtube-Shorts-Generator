@@ -3,6 +3,12 @@
 Each backend reads its key, model and base URL from the resolved
 :class:`~shorts_generator.config.Settings`, so the whole provider setup lives in
 the single ``.env`` file.
+
+Retries are for answers that might come on the next try. An error that no retry
+can fix — a spent daily quota, a rejected key, a retired model — is raised as a
+:class:`~shorts_generator.provider_errors.ProviderError` instead, which stops the
+whole batch: the remaining videos would walk into the same wall, each after
+paying for its own Whisper pass, scene scan and upload.
 """
 
 from __future__ import annotations
@@ -15,41 +21,31 @@ from .config import (
     require_gemini_key,
     require_openai_key,
 )
+from .provider_errors import (
+    RunFatalError,
+    http_status,
+    is_quota_exhausted,
+    is_retryable_provider_error,
+    provider_error,
+)
 
 # Значения по умолчанию, если в Settings не заданы LLM_MAX_ATTEMPTS/LLM_RETRY_BACKOFF.
 LLM_MAX_ATTEMPTS = 5
 LLM_RETRY_BACKOFF = 2.0
 
-_RETRYABLE_MARKERS = (
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "resource_exhausted",
-    "resource exhausted",
-    "unavailable",
-    "overloaded",
-    "high demand",
-    "rate limit",
-    "rate_limit",
-    "too many requests",
-    "timed out",
-    "timeout",
-    "deadline",
-    "temporarily",
-    "try again",
-)
 
+def _call_with_retries(call, settings: Settings, *, engine: str, model: str):
+    """Вызвать ``call()``, повторяя временные ошибки с экспоненциальным бэкоффом.
 
-def _is_retryable(exc: Exception) -> bool:
-    """True, если ошибка выглядит как временная и её стоит повторить."""
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in text for marker in _RETRYABLE_MARKERS)
-
-
-def _call_with_retries(call, settings: Settings):
-    """Вызвать ``call()``, повторяя временные ошибки с экспоненциальным бэкоффом."""
+    Повтор имеет смысл только для ответа, который может прийти со следующей
+    попытки. Исчерпанная квота — нет: провайдер сам пишет «повторите через
+    3ч24м», и наши 2-4-8-16 секунд её не пересидят, поэтому такой 429 улетает
+    сразу, как и любая другая ошибка, которую повтор не исправит. И то и другое
+    поднимается как :class:`~shorts_generator.provider_errors.ProviderError`, из-за
+    которого ``pipeline._run`` останавливает весь батч: следующие видео упрутся
+    в ту же стену, каждое — после своей транскрибации, сканирования сцен и
+    заливки.
+    """
     attempts = max(1, int(getattr(settings, "llm_max_attempts", 0) or LLM_MAX_ATTEMPTS))
     backoff = abs(
         float(getattr(settings, "llm_retry_backoff", LLM_RETRY_BACKOFF) or 0.0)
@@ -57,9 +53,15 @@ def _call_with_retries(call, settings: Settings):
     for attempt in range(1, attempts + 1):
         try:
             return call()
-        except Exception as exc:  # noqa: BLE001 - classify by message text
-            if attempt >= attempts or not _is_retryable(exc):
-                raise
+        except Exception as exc:  # noqa: BLE001 - classify by status/message
+            # Спенчённая квота и всё, что повтор не исправит, — сразу наружу:
+            # ждать её бессмысленно, а лишние попытки лишь маскируют причину.
+            if is_quota_exhausted(exc) or not is_retryable_provider_error(exc):
+                raise provider_error(engine, model, exc) from exc
+            # Временным это выглядело на каждой попытке (5xx, таймаут, отдача
+            # «попробуйте позже») — но ответа так и не пришло.
+            if attempt >= attempts:
+                raise provider_error(engine, model, exc, attempts=attempt) from exc
             delay = backoff * (2 ** (attempt - 1))
             print(
                 f"[llm] transient provider error ({type(exc).__name__}: {exc}); "
@@ -87,8 +89,33 @@ def call_openai_llm(prompt: str, settings: Settings) -> str:
             messages=[{"role": "user", "content": prompt}],
         ),
         settings,
+        engine="openai",
+        model=settings.openai_model,
     )
     return response.choices[0].message.content or ""
+
+
+def _json_mode_rejected(exc: Exception) -> bool:
+    """True when the failure looks like "this model has no JSON mode".
+
+    Exists to tell a model that merely dislikes ``response_format`` — worth one
+    plain retry without it — apart from a provider that cannot answer at all (an
+    unknown model, a spent quota, a rejected key), where the same call without
+    ``response_format`` would only spend a second retry budget on the very same
+    wall.
+    """
+    if http_status(exc) == 400:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "response_format",
+            "response format",
+            "json_object",
+            "json mode",
+        )
+    )
 
 
 def call_deepseek_llm(prompt: str, settings: Settings) -> str:
@@ -98,7 +125,9 @@ def call_deepseek_llm(prompt: str, settings: Settings) -> str:
     ``base_url`` at the DeepSeek API. We ask for JSON output so the highlight
     parser always receives a machine-readable response; if the selected model
     rejects JSON mode (e.g. ``deepseek-reasoner``), we transparently retry
-    without it.
+    without it. That fallback covers a rejection of JSON mode only: a
+    provider-side failure (an unknown model, a spent quota) is not retried a
+    second time, because the plain call would fail exactly like the first one.
     """
     try:
         from openai import OpenAI  # type: ignore
@@ -121,11 +150,23 @@ def call_deepseek_llm(prompt: str, settings: Settings) -> str:
                 **extra,
             ),
             settings,
+            engine="deepseek",
+            model=settings.deepseek_model,
         )
 
     try:
         response = _create(response_format={"type": "json_object"})
-    except Exception:
+    except RunFatalError as exc:
+        # A model that merely dislikes ``response_format`` is worth one plain
+        # retry; a provider that cannot answer at all — an unknown model, a spent
+        # quota, a rejected key — is not. Asking again without ``response_format``
+        # there would spend a second full retry budget to reach the same wall,
+        # which is what a real run did: ten 503s instead of five, and twice the
+        # log lines for one cause.
+        if not _json_mode_rejected(exc):
+            raise
+        response = _create()
+    except Exception:  # noqa: BLE001 - the JSON-mode fallback is deliberately broad
         # Some DeepSeek-compatible models reject response_format/temperature;
         # fall back to a plain chat completion rather than failing.
         response = _create()
@@ -159,6 +200,8 @@ def call_gemini_llm(prompt: str, settings: Settings) -> str:
             },
         ),
         settings,
+        engine="gemini",
+        model=settings.gemini_model,
     )
     return response.text or ""
 

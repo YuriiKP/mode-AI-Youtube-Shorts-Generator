@@ -822,12 +822,23 @@ def _print_shorts(result: Dict, enhanced: bool) -> None:
 
 
 def _print_failures(result: Dict) -> None:
-    """List the source videos that failed while the rest of the run continued."""
+    """List the source videos that failed and say what happened to the rest.
+
+    A run that carried on past a per-video problem (bad audio, a broken ffmpeg
+    pass, a window with no usable material) processed every remaining input, so
+    the header reports that. A run that stopped early did so on a failure that
+    was not about one input — the provider refusing every request the same way —
+    and never touched the sources that came after it; saying "the rest were
+    processed" there would be a lie, so the header names the early stop instead.
+    """
     failures = result.get("failures") or []
     if not failures:
         return
     print("\n" + "-" * 72)
-    print(f"Failed videos: {len(failures)} (the rest were processed)")
+    if result.get("aborted"):
+        print(f"Failed videos: {len(failures)} (the run stopped at the first one)")
+    else:
+        print(f"Failed videos: {len(failures)} (the rest were processed)")
     for failure in failures:
         source = failure.get("source_video_url")
         print(
@@ -854,11 +865,19 @@ def _exit_code_for(result: Dict) -> int:
     """
     failures = result.get("failures") or []
     if failures:
-        print(
-            f"\n{len(failures)} video(s) failed; the clips and shorts_info from "
-            "the other inputs were kept.",
-            file=sys.stderr,
-        )
+        if result.get("aborted"):
+            print(
+                f"\n{len(failures)} video(s) failed; the run stopped there because "
+                "the failure was not about one input — the remaining inputs were "
+                "left untouched and can be processed by re-running.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"\n{len(failures)} video(s) failed; the clips and shorts_info from "
+                "the other inputs were kept.",
+                file=sys.stderr,
+            )
         return 1
     return 0
 

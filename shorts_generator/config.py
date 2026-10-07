@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Optional
 
+from .provider_errors import RunFatalError
+
 # ---------------------------------------------------------------------------
 # Validation constants
 # ---------------------------------------------------------------------------
@@ -898,7 +900,11 @@ def _validate(settings: Settings) -> None:
 
 def require_openai_key(settings: Settings) -> str:
     if not settings.openai_api_key:
-        raise RuntimeError(
+        # A missing key is not a property of this video: every remaining input
+        # would fail on it identically, so this is a ``RunFatalError`` — the
+        # signal ``pipeline._run`` uses to stop the batch at the first input
+        # instead of repeating the same failure once per video.
+        raise RunFatalError(
             "OPENAI_API_KEY is not set. It is required for highlight ranking "
             "when LLM_PROVIDER=openai. Add it to your .env."
         )
@@ -907,7 +913,7 @@ def require_openai_key(settings: Settings) -> str:
 
 def require_deepseek_key(settings: Settings) -> str:
     if not settings.deepseek_api_key:
-        raise RuntimeError(
+        raise RunFatalError(
             "DEEPSEEK_API_KEY is not set. It is required when "
             "LLM_PROVIDER=deepseek. Add it to your .env or switch LLM_PROVIDER."
         )
@@ -916,7 +922,7 @@ def require_deepseek_key(settings: Settings) -> str:
 
 def require_gemini_key(settings: Settings) -> str:
     if not settings.gemini_api_key:
-        raise RuntimeError(
+        raise RunFatalError(
             "GEMINI_API_KEY is not set. It is required when "
             "LLM_PROVIDER=gemini, or for the cloud visual indexer "
             "(VISUAL_INDEXER_TYPE=gemini_video). Add it to your .env, "
