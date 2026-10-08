@@ -203,6 +203,10 @@ def _process_one(
             slide_effect=settings.slide_effect,
             slide_gap=settings.slide_transition_gap,
             slide_range=settings.slide_range,
+            cut_effect=settings.cut_effect,
+            cut_effect_duration=settings.cut_effect_duration,
+            cut_effect_types=settings.cut_effect_types,
+            cut_effect_max=settings.cut_effect_max,
             start_index=start_index,
         )
 

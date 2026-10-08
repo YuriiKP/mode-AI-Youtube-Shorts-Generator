@@ -7,16 +7,23 @@ Two stages per highlight:
      cascade — same approach as the original repo, no external models). When
      SLIDE_EFFECT is enabled the window instead pans left/right between the
      scene transitions detected inside the clip (see scene_transitions.py),
-     alternating the direction at every transition.
+     alternating the direction at every transition. When CUT_EFFECT is enabled
+     those same cuts are instead (or additionally) blended together — a short
+     dissolve / fade / flash / zoom that softens the hard cut without changing
+     the clip length or its audio, so subtitles and music stay in sync.
 """
 
+import collections
+import math
 import os
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .scene_transitions import (
+    build_cut_effects,
     build_slide_segments,
     detect_transitions,
+    parse_cut_effect_styles,
     slide_progress,
 )
 
@@ -73,6 +80,109 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
+class _CutEffectRunner:
+    """Applies the planned cut transitions while the crop pass streams frames.
+
+    Instances are driven once per output frame, in order, by
+    :func:`_reframe_vertical`. A short buffer of the *raw* cropped frames is kept
+    so a ``dissolve`` can blend the frames before a cut with the ones after it
+    (the ``fade`` / ``flash`` / ``zoom`` styles need no history). The clip keeps
+    its length and its audio, so the caller's timings never shift.
+    """
+
+    # Peak scale of the ``zoom`` style: the frame grows by this fraction at the
+    # middle of the window and returns to 1 by its end.
+    _ZOOM_PEAK = 0.12
+
+    def __init__(self, effects, crop_w: int, crop_h: int) -> None:
+        self.effects = effects
+        self.crop_w = crop_w
+        self.crop_h = crop_h
+        self.index = 0
+        self._snapshot = None
+        # Only a ``dissolve`` needs history; size the ring buffer to the longest
+        # dissolve window so ``list(buffer)[-after:]`` always has enough frames.
+        max_history = max(
+            (
+                effect.end_frame - effect.cut_frame
+                for effect in effects
+                if effect.style == "dissolve"
+            ),
+            default=0,
+        )
+        self.buffer = collections.deque(maxlen=max_history) if max_history else None
+
+    def apply(self, frame_index: int, frame):
+        """Return ``frame`` with any transition for ``frame_index`` baked in."""
+        # Retire effects that already ended (and drop their dissolve snapshot).
+        while (
+            self.index < len(self.effects)
+            and frame_index >= self.effects[self.index].end_frame
+        ):
+            self.index += 1
+            self._snapshot = None
+
+        result = frame
+        if self.index < len(self.effects):
+            effect = self.effects[self.index]
+            if effect.start_frame <= frame_index < effect.end_frame:
+                result = self._render(effect, frame_index, frame)
+
+        # Buffer the *raw* frame: the dissolve reads history from before the cut.
+        if self.buffer is not None:
+            self.buffer.append(frame)
+        return result
+
+    def _render(self, effect, frame_index: int, frame):
+        import cv2
+        import numpy as np
+
+        cut, start, end, style = effect
+        before = max(1, cut - start)
+        after = max(1, end - cut)
+
+        if style == "dissolve":
+            if frame_index < cut:
+                return frame  # frames before the cut are written untouched
+            if self._snapshot is None:
+                history = list(self.buffer) if self.buffer is not None else []
+                self._snapshot = history[-after:]
+            step = frame_index - cut
+            if step >= len(self._snapshot):
+                return frame
+            alpha = (step + 1) / after
+            old = self._snapshot[step].astype(np.float32)
+            new = frame.astype(np.float32)
+            blended = old * (1.0 - alpha) + new * alpha
+            return np.ascontiguousarray(np.clip(blended, 0, 255).astype(np.uint8))
+
+        if style in ("fade", "flash"):
+            color = 0.0 if style == "fade" else 255.0
+            if frame_index < cut:
+                weight = (frame_index - start + 1) / before  # darken towards the cut
+            else:
+                weight = 1.0 - (frame_index - cut) / after  # brighten after it
+            mixed = frame.astype(np.float32) * (1.0 - weight) + color * weight
+            return np.ascontiguousarray(np.clip(mixed, 0, 255).astype(np.uint8))
+
+        if style == "zoom":
+            span = max(1, end - start)
+            position = (frame_index - start) / span
+            scale = 1.0 + self._ZOOM_PEAK * math.sin(math.pi * position)
+            if abs(scale - 1.0) < 1e-3:
+                return frame
+            new_w = max(2, int(round(self.crop_w * scale)))
+            new_h = max(2, int(round(self.crop_h * scale)))
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            left = (new_w - self.crop_w) // 2
+            top = (new_h - self.crop_h) // 2
+            return np.ascontiguousarray(
+                resized[top : top + self.crop_h, left : left + self.crop_w]
+            )
+
+        return frame
+
+
 def _reframe_vertical(
     in_path: str,
     out_path: str,
@@ -81,6 +191,10 @@ def _reframe_vertical(
     slide_effect: bool = False,
     slide_gap: float = 3.0,
     slide_range: float = 1.0,
+    cut_effect: bool = False,
+    cut_effect_duration: float = 0.25,
+    cut_effect_types: Sequence[str] = ("dissolve",),
+    cut_effect_max: int = 3,
 ) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -150,21 +264,44 @@ def _reframe_vertical(
     range_fraction = min(1.0, max(0.0, slide_range))
     travel = int(round(max_x0 * range_fraction))
     slide_base = (max_x0 - travel) // 2
-    slide_segments = []
-    if slide_effect and max_x0 > 0 and travel > 0:
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-        duration = (frame_count / fps) if fps else 0.0
+
+    # Scene cuts inside the clip are needed by both the slide (to know where to
+    # pan) and the cut effects (to know where to blend), so detect them once.
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = (frame_count / fps) if fps else 0.0
+    transitions: List[float] = []
+    if (slide_effect and max_x0 > 0 and travel > 0) or cut_effect:
         try:
             transitions = detect_transitions(in_path)
         except Exception as exc:
             print(f"[clip] transition detection failed: {exc}", flush=True)
             transitions = []
+
+    slide_segments = []
+    if slide_effect and max_x0 > 0 and travel > 0:
         slide_segments = build_slide_segments(transitions, duration, gap=slide_gap)
         print(
             f"[clip] slide effect: {len(transitions)} transition(s) -> "
             f"{len(slide_segments)} slide segment(s)",
             flush=True,
         )
+
+    cut_effects = []
+    if cut_effect:
+        cut_effects = build_cut_effects(
+            transitions,
+            duration,
+            fps,
+            window_seconds=cut_effect_duration,
+            styles=parse_cut_effect_styles(cut_effect_types),
+            max_count=cut_effect_max,
+        )
+        print(
+            f"[clip] cut effect: {len(transitions)} transition(s) -> "
+            f"{len(cut_effects)} blend(s)",
+            flush=True,
+        )
+    cut_runner = _CutEffectRunner(cut_effects, crop_w, crop_h) if cut_effects else None
 
     frame_index = 0
     last_center: Optional[Tuple[int, int]] = None
@@ -213,6 +350,8 @@ def _reframe_vertical(
             # code" when a non-contiguous array reaches ``VideoWriter.write``,
             # so hand it a contiguous copy instead.
             cropped = np.ascontiguousarray(frame[y0 : y0 + crop_h, x0 : x0 + crop_w])
+            if cut_runner is not None:
+                cropped = cut_runner.apply(frame_index, cropped)
             writer.write(cropped)
             frame_index += 1
     finally:
@@ -264,6 +403,10 @@ def reframe_video(
     slide_effect: bool = False,
     slide_gap: float = 3.0,
     slide_range: float = 1.0,
+    cut_effect: bool = False,
+    cut_effect_duration: float = 0.25,
+    cut_effect_types: Sequence[str] = ("dissolve",),
+    cut_effect_max: int = 3,
 ) -> str:
     """Reframe an already-built video to ``aspect_ratio``, without re-cutting.
 
@@ -296,6 +439,10 @@ def reframe_video(
         slide_effect=slide_effect,
         slide_gap=slide_gap,
         slide_range=slide_range,
+        cut_effect=cut_effect,
+        cut_effect_duration=cut_effect_duration,
+        cut_effect_types=cut_effect_types,
+        cut_effect_max=cut_effect_max,
     )
 
 
@@ -309,6 +456,10 @@ def crop_clip(
     slide_effect: bool = False,
     slide_gap: float = 3.0,
     slide_range: float = 1.0,
+    cut_effect: bool = False,
+    cut_effect_duration: float = 0.25,
+    cut_effect_types: Sequence[str] = ("dissolve",),
+    cut_effect_max: int = 3,
 ) -> str:
     """Cut + reframe one highlight, returning the mp4 path."""
     cut_path = out_path + ".cut.mp4"
@@ -322,6 +473,10 @@ def crop_clip(
             slide_effect=slide_effect,
             slide_gap=slide_gap,
             slide_range=slide_range,
+            cut_effect=cut_effect,
+            cut_effect_duration=cut_effect_duration,
+            cut_effect_types=cut_effect_types,
+            cut_effect_max=cut_effect_max,
         )
     finally:
         if os.path.exists(cut_path):
@@ -338,6 +493,10 @@ def crop_highlights(
     slide_effect: bool = False,
     slide_gap: float = 3.0,
     slide_range: float = 1.0,
+    cut_effect: bool = False,
+    cut_effect_duration: float = 0.25,
+    cut_effect_types: Sequence[str] = ("dissolve",),
+    cut_effect_max: int = 3,
     start_index: int = 0,
 ) -> List[Dict]:
     out_dir = out_dir or DEFAULT_OUTPUT_DIR
@@ -366,6 +525,10 @@ def crop_highlights(
                 slide_effect=slide_effect,
                 slide_gap=slide_gap,
                 slide_range=slide_range,
+                cut_effect=cut_effect,
+                cut_effect_duration=cut_effect_duration,
+                cut_effect_types=cut_effect_types,
+                cut_effect_max=cut_effect_max,
             )
             results.append({**h, "clip_url": out_path})
         except Exception as e:

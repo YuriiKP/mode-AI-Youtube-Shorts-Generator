@@ -158,6 +158,38 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         "edge, 0 = no movement (default: 1)",
     )
     parser.add_argument(
+        "--cut-effect",
+        dest="cut_effect",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="blend a short transition over the source scene cuts inside each "
+        "clip, softening the hard cuts (default: off)",
+    )
+    parser.add_argument(
+        "--cut-effect-duration",
+        dest="cut_effect_duration",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="length of each cut transition in seconds (default: 0.25)",
+    )
+    parser.add_argument(
+        "--cut-effect-types",
+        dest="cut_effect_types",
+        default=None,
+        metavar="LIST",
+        help="comma-separated transition styles rotated across cuts: "
+        "dissolve, fade, flash, zoom (default: dissolve)",
+    )
+    parser.add_argument(
+        "--cut-effect-max",
+        dest="cut_effect_max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="maximum transitions per clip (default: 3)",
+    )
+    parser.add_argument(
         "--visual-indexing",
         dest="visual_indexer_enabled",
         action=argparse.BooleanOptionalAction,

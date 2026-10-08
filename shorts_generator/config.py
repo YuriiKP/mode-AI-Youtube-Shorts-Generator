@@ -313,6 +313,22 @@ class Settings:
     # до которых может уезжать кадр.
     slide_range: float = 1.0
 
+    # Переходы на внутренних резах (эффект нарезки) -----------------------
+    # В отличие от slide_effect (который лишь *двигает* окно кропа), эти
+    # эффекты *смешивают* две сцены на внутреннем резе источника: dissolve
+    # растворяет кадры до и после реза, fade уводит в чёрный, flash — в белый,
+    # zoom делает врез-зум. Длительность клипа и его звук не меняются, поэтому
+    # субтитры и музыка остаются в синхроне. Применяется на шаге нарезки/кропа.
+    cut_effect: bool = False
+    # Длительность одного перехода в секундах (окно вокруг реза).
+    cut_effect_duration: float = 0.25
+    # Стили переходов через запятую: dissolve, fade, flash, zoom. Один стиль —
+    # везде одинаково; несколько — по резам по очереди.
+    cut_effect_types: str = "dissolve"
+    # Максимум переходов на один клип (0 — выключено). Если подходящих резов
+    # больше, берётся равномерная выборка по всему клипу.
+    cut_effect_max: int = 3
+
     # LLM (highlight ranking) ---------------------------------------------
     llm_provider: str = "openai"  # openai | deepseek | gemini
     openai_api_key: str = ""
@@ -557,6 +573,7 @@ _STR_FIELDS = {
     "output_dir",
     "aspect_ratio",
     "download_format",
+    "cut_effect_types",
     "llm_provider",
     "openai_api_key",
     "openai_model",
@@ -591,6 +608,7 @@ _BOOL_FIELDS = {
     "clip_snap_to_transcript",
     "two_stage_analysis",
     "slide_effect",
+    "cut_effect",
     "montage_mode",
     "unique_mirror",
     "unique_loudness",
@@ -612,6 +630,7 @@ _INT_FIELDS = {
     "subtitle_shadow_offset_x",
     "subtitle_shadow_offset_y",
     "unique_crop",
+    "cut_effect_max",
     "visual_indexer_max_height",
     "llm_max_attempts",
 }
@@ -639,6 +658,7 @@ _FLOAT_FIELDS = {
     "speed",
     "slide_transition_gap",
     "slide_range",
+    "cut_effect_duration",
     "unique_noise",
     "unique_brightness",
     "unique_contrast",
@@ -778,6 +798,10 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("SLIDE_TRANSITION_GAP must be zero or greater")
     if not 0.0 <= settings.slide_range <= 1.0:
         raise ConfigError("SLIDE_RANGE must be between 0 and 1")
+    if settings.cut_effect_duration < 0:
+        raise ConfigError("CUT_EFFECT_DURATION must be zero or greater")
+    if settings.cut_effect_max < 0:
+        raise ConfigError("CUT_EFFECT_MAX must be zero (off) or greater")
     if settings.font_size <= 0:
         raise ConfigError("FONT_SIZE must be a positive integer")
     if settings.threads < 0:
