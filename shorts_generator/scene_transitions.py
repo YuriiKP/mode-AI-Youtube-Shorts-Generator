@@ -14,7 +14,10 @@ working without the extra dependency.
 
 from __future__ import annotations
 
+import os
 from typing import List, NamedTuple, Sequence, Tuple, TypeVar
+
+from .timing import time_stage
 
 # A slide segment: ``(start_seconds, end_seconds, direction)`` where
 # ``direction`` is ``+1`` towards the right edge of the frame, ``-1`` to the left.
@@ -36,11 +39,37 @@ _T = TypeVar("_T")
 
 
 def detect_transitions(video_path: str, threshold: float = 27.0) -> List[float]:
-    """Return the scene-change times (in seconds) found inside ``video_path``."""
-    try:
-        return _detect_with_scenedetect(video_path)
-    except Exception:
-        return _detect_with_opencv(video_path, threshold=threshold)
+    """Return the scene-change times (in seconds) found inside ``video_path``.
+
+    Scene detection is a frame-by-frame scan of the whole clip, so — like the
+    transcription and visual-index stages — it first announces what it is about
+    to do, then how it went, and is timed as its own ``transitions`` stage. The
+    OpenCV fallback is reported explicitly: without the extra ``scenedetect``
+    dependency detection still runs, but a silently degraded scan would look
+    exactly like a clip that simply has no cuts.
+    """
+    print(
+        f"[transitions] detecting scene cuts in {os.path.basename(video_path)} "
+        "— frame-by-frame scan of the clip",
+        flush=True,
+    )
+    with time_stage("transitions"):
+        try:
+            transitions = _detect_with_scenedetect(video_path)
+            detector = "PySceneDetect"
+        except Exception as exc:
+            print(
+                f"[transitions] PySceneDetect unavailable ({exc}); "
+                "using the OpenCV frame-difference fallback",
+                flush=True,
+            )
+            transitions = _detect_with_opencv(video_path, threshold=threshold)
+            detector = "OpenCV"
+    print(
+        f"[transitions] {len(transitions)} cut(s)/fade(s) via {detector}",
+        flush=True,
+    )
+    return transitions
 
 
 def _detect_with_scenedetect(video_path: str) -> List[float]:
@@ -152,10 +181,29 @@ class CutEffect(NamedTuple):
     style: str
 
 
-# Styles the applier understands. ``dissolve`` blends old and new shots through
-# each other, ``fade`` dips through black, ``flash`` through white and ``zoom``
-# punches in and back out at the cut.
-VALID_CUT_EFFECTS: Tuple[str, ...] = ("dissolve", "fade", "flash", "zoom")
+# Styles the applier understands (see ``clipper._CutEffectRunner``):
+#   * ``dissolve`` — blend the old and new shots through each other;
+#   * ``merge``    — same blend but blurred into a soft "melt";
+#   * ``fade``     — dip through black at the cut;
+#   * ``flash``    — dip through white at the cut;
+#   * ``zoom``     — punch the frame in and back out at the cut;
+#   * ``chroma``   — zoom punch plus a red/blue split (chromatic zoom);
+#   * ``whip``     — horizontal motion-blur whip-pan;
+#   * ``spin``     — rotate the frame through the cut;
+#   * ``shake``    — jitter the frame at the cut;
+#   * ``glitch``   — RGB split with sliced bands (digital glitch).
+VALID_CUT_EFFECTS: Tuple[str, ...] = (
+    "dissolve",
+    "merge",
+    "fade",
+    "flash",
+    "zoom",
+    "chroma",
+    "whip",
+    "spin",
+    "shake",
+    "glitch",
+)
 
 
 def parse_cut_effect_styles(raw: "str | Sequence[str] | None") -> List[str]:

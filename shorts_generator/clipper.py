@@ -9,17 +9,20 @@ Two stages per highlight:
      scene transitions detected inside the clip (see scene_transitions.py),
      alternating the direction at every transition. When CUT_EFFECT is enabled
      those same cuts are instead (or additionally) blended together — a short
-     dissolve / fade / flash / zoom that softens the hard cut without changing
+     dissolve / fade / flash / zoom / chroma / merge / whip / spin / shake /
+     glitch that softens the hard cut without changing
      the clip length or its audio, so subtitles and music stay in sync.
 """
 
 import collections
 import math
 import os
+import random
 import subprocess
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .scene_transitions import (
+    CutEffect,
     build_cut_effects,
     build_slide_segments,
     detect_transitions,
@@ -80,33 +83,150 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
+# --- pixel helpers for the cut transitions ---------------------------------
+# The cut effects re-mix the frames the crop pass already produced, so they only
+# need a handful of cheap pixel operations (blend, shift, split, blur, rotate).
+# They run inside the per-frame loop, hence the lazily imported cv2 / numpy.
+
+
+def _as_u8(array, np):
+    """Clamp a float image back into 8-bit and make it contiguous."""
+    return np.ascontiguousarray(np.clip(array, 0, 255).astype(np.uint8))
+
+
+def _mix(frame_a, frame_b, alpha, np):
+    """Blend ``frame_a`` (weight ``1-alpha``) with ``frame_b`` (weight ``alpha``)."""
+    if alpha >= 1.0:
+        return np.ascontiguousarray(frame_b)
+    if alpha <= 0.0:
+        return np.ascontiguousarray(frame_a)
+    a = frame_a.astype(np.float32)
+    b = frame_b.astype(np.float32)
+    return _as_u8(a * (1.0 - alpha) + b * alpha, np)
+
+
+def _shift_frame(frame, delta, np, axis=1):
+    """Shift a frame by ``delta`` pixels along ``axis``, replicating the edge."""
+    if delta == 0:
+        return frame
+    out = frame.copy()
+    size = frame.shape[axis]
+    distance = abs(delta)
+    if distance >= size:
+        return out
+    if axis == 1:
+        if delta > 0:
+            out[:, distance:] = frame[:, : size - distance]
+        else:
+            out[:, : size - distance] = frame[:, distance:]
+    else:
+        if delta > 0:
+            out[distance:, :] = frame[: size - distance, :]
+        else:
+            out[: size - distance, :] = frame[distance:, :]
+    return out
+
+
+def _chroma_split(frame, shift, np):
+    """Push the red and blue channels apart by ``shift`` px — colour fringing."""
+    if shift == 0:
+        return frame
+    out = frame.copy()
+    out[..., 2] = _shift_frame(frame, shift, np)[..., 2]
+    out[..., 0] = _shift_frame(frame, -shift, np)[..., 0]
+    return out
+
+
+def _scale_center(frame, scale, cv2, np):
+    """Zoom in by ``scale`` and crop back to size (edge content is kept)."""
+    if scale <= 1.0 + 1e-3:
+        return frame
+    height, width = frame.shape[:2]
+    new_w = max(2, int(round(width * scale)))
+    new_h = max(2, int(round(height * scale)))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    return np.ascontiguousarray(resized[top : top + height, left : left + width])
+
+
+def _gaussian(frame, sigma, cv2, np):
+    """Gaussian blur with ``sigma``; a no-op for tiny values."""
+    if sigma <= 0.05:
+        return frame
+    return np.ascontiguousarray(
+        cv2.GaussianBlur(frame, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    )
+
+
+def _motion_blur(frame, length, np):
+    """Average ``length`` horizontal shifts — a directional (whip) blur."""
+    if length <= 0:
+        return frame
+    acc = frame.astype(np.float32)
+    for step in range(1, length + 1):
+        acc += _shift_frame(frame, step, np).astype(np.float32)
+    return acc / float(length + 1)
+
+
+def _rotate(frame, angle, cv2, np):
+    """Rotate by ``angle`` degrees, replicating edges instead of showing black."""
+    if abs(angle) < 0.05:
+        return frame
+    height, width = frame.shape[:2]
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, 1.0)
+    rotated = cv2.warpAffine(
+        frame,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return np.ascontiguousarray(rotated)
+
+
 class _CutEffectRunner:
     """Applies the planned cut transitions while the crop pass streams frames.
 
     Instances are driven once per output frame, in order, by
     :func:`_reframe_vertical`. A short buffer of the *raw* cropped frames is kept
-    so a ``dissolve`` can blend the frames before a cut with the ones after it
-    (the ``fade`` / ``flash`` / ``zoom`` styles need no history). The clip keeps
-    its length and its audio, so the caller's timings never shift.
+    so the cross-blend styles (``dissolve`` / ``merge``) can mix the frames before
+    a cut with the ones after it; the punch styles (``zoom`` / ``chroma`` / ...)
+    need no history. The clip keeps its length and its audio, so the caller's
+    timings never shift.
     """
 
-    # Peak scale of the ``zoom`` style: the frame grows by this fraction at the
-    # middle of the window and returns to 1 by its end.
-    _ZOOM_PEAK = 0.12
+    _ZOOM_PEAK: float = 0.12  # ``zoom`` punch magnitude
+    _CHROMA_ZOOM_PEAK: float = 0.16  # ``chroma`` zoom strength
+    _CHROMA_SPLIT_PEAK: int = 7  # ``chroma`` red/blue separation, px
+    _MERGE_BLUR_PEAK: float = 7.0  # ``merge`` blur at the cut, sigma
+    _GLITCH_SPLIT_PEAK: int = 9  # ``glitch`` channel separation, px
+    _GLITCH_SHIFT_PEAK: int = 14  # ``glitch`` slice displacement, px
+    _GLITCH_SHAKE_PEAK: int = 7  # ``glitch`` whole-frame jitter, px
+    _WHIP_BLUR_PEAK: int = 16  # ``whip`` motion-blur length, px
+    _WHIP_SHIFT_PEAK: int = 10  # ``whip`` pan offset, px
+    _SPIN_PEAK: float = 5.0  # ``spin`` rotation, degrees
+    _SHAKE_PEAK: int = 12  # ``shake`` jitter, px
 
-    def __init__(self, effects, crop_w: int, crop_h: int) -> None:
+    # Styles that need the pre-cut frames buffered to cross-blend the shots.
+    _BLEND_STYLES: Tuple[str, ...] = ("dissolve", "merge")
+
+    def __init__(
+        self, effects: "Sequence[CutEffect]", crop_w: int, crop_h: int
+    ) -> None:
         self.effects = effects
-        self.crop_w = crop_w
-        self.crop_h = crop_h
-        self.index = 0
+        self.crop_w: int = crop_w
+        self.crop_h: int = crop_h
+        self.index: int = 0
         self._snapshot = None
-        # Only a ``dissolve`` needs history; size the ring buffer to the longest
-        # dissolve window so ``list(buffer)[-after:]`` always has enough frames.
+        self._punch_dir: int = 1  # alternates the direction of directional styles
+        # Only the cross-blend styles need history; size the ring buffer to the
+        # longest such window so ``list(buffer)[-after:]`` always has enough.
         max_history = max(
             (
                 effect.end_frame - effect.cut_frame
                 for effect in effects
-                if effect.style == "dissolve"
+                if effect.style in self._BLEND_STYLES
             ),
             default=0,
         )
@@ -114,13 +234,14 @@ class _CutEffectRunner:
 
     def apply(self, frame_index: int, frame):
         """Return ``frame`` with any transition for ``frame_index`` baked in."""
-        # Retire effects that already ended (and drop their dissolve snapshot).
+        # Retire effects that already ended (and drop their cross-blend snapshot).
         while (
             self.index < len(self.effects)
             and frame_index >= self.effects[self.index].end_frame
         ):
             self.index += 1
             self._snapshot = None
+        self._punch_dir = 1 if self.index % 2 == 0 else -1
 
         result = frame
         if self.index < len(self.effects):
@@ -128,21 +249,32 @@ class _CutEffectRunner:
             if effect.start_frame <= frame_index < effect.end_frame:
                 result = self._render(effect, frame_index, frame)
 
-        # Buffer the *raw* frame: the dissolve reads history from before the cut.
+        # Buffer the *raw* frame: the cross-blend styles read history before the cut.
         if self.buffer is not None:
             self.buffer.append(frame)
         return result
 
-    def _render(self, effect, frame_index: int, frame):
+    def _render(self, effect: CutEffect, frame_index: int, frame):
         import cv2
         import numpy as np
 
         cut, start, end, style = effect
         before = max(1, cut - start)
         after = max(1, end - cut)
+        span = max(1, end - start)
 
-        if style == "dissolve":
+        # Triangular ramp: 0 at the window edges, 1 exactly at the cut. The punch
+        # styles scale their strength with it, so the effect peaks on the cut and
+        # fades back to the untouched frame before the window ends.
+        if frame_index < cut:
+            punch = (frame_index - start + 1) / before
+        else:
+            punch = 1.0 - (frame_index - cut) / after
+
+        if style in self._BLEND_STYLES:
             if frame_index < cut:
+                if style == "merge":
+                    return _gaussian(frame, self._MERGE_BLUR_PEAK * punch, cv2, np)
                 return frame  # frames before the cut are written untouched
             if self._snapshot is None:
                 history = list(self.buffer) if self.buffer is not None else []
@@ -151,34 +283,72 @@ class _CutEffectRunner:
             if step >= len(self._snapshot):
                 return frame
             alpha = (step + 1) / after
-            old = self._snapshot[step].astype(np.float32)
-            new = frame.astype(np.float32)
-            blended = old * (1.0 - alpha) + new * alpha
-            return np.ascontiguousarray(np.clip(blended, 0, 255).astype(np.uint8))
+            out = _mix(self._snapshot[step], frame, alpha, np)
+            if style == "merge":
+                out = _gaussian(out, self._MERGE_BLUR_PEAK * punch, cv2, np)
+            return out
 
         if style in ("fade", "flash"):
             color = 0.0 if style == "fade" else 255.0
-            if frame_index < cut:
-                weight = (frame_index - start + 1) / before  # darken towards the cut
-            else:
-                weight = 1.0 - (frame_index - cut) / after  # brighten after it
-            mixed = frame.astype(np.float32) * (1.0 - weight) + color * weight
-            return np.ascontiguousarray(np.clip(mixed, 0, 255).astype(np.uint8))
+            mixed = frame.astype(np.float32) * (1.0 - punch) + color * punch
+            return _as_u8(mixed, np)
 
         if style == "zoom":
-            span = max(1, end - start)
             position = (frame_index - start) / span
             scale = 1.0 + self._ZOOM_PEAK * math.sin(math.pi * position)
-            if abs(scale - 1.0) < 1e-3:
-                return frame
-            new_w = max(2, int(round(self.crop_w * scale)))
-            new_h = max(2, int(round(self.crop_h * scale)))
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            left = (new_w - self.crop_w) // 2
-            top = (new_h - self.crop_h) // 2
-            return np.ascontiguousarray(
-                resized[top : top + self.crop_h, left : left + self.crop_w]
+            return _scale_center(frame, scale, cv2, np)
+
+        if style == "chroma":
+            # Zoom punch plus a red/blue split that peaks on the cut — the classic
+            # "chromatic zoom" edit transition.
+            out = _scale_center(frame, 1.0 + self._CHROMA_ZOOM_PEAK * punch, cv2, np)
+            return _chroma_split(out, int(round(self._CHROMA_SPLIT_PEAK * punch)), np)
+
+        if style == "whip":
+            direction = self._punch_dir
+            shifted = _shift_frame(
+                frame, int(round(self._WHIP_SHIFT_PEAK * punch)) * direction, np
             )
+            length = int(round(self._WHIP_BLUR_PEAK * punch))
+            return _as_u8(_motion_blur(shifted, length, np), np)
+
+        if style == "spin":
+            angle = self._SPIN_PEAK * punch * self._punch_dir
+            out = _rotate(frame, angle, cv2, np)
+            return _scale_center(out, 1.0 + 0.05 * punch, cv2, np)
+
+        if style == "shake":
+            rng = random.Random(frame_index)
+            amplitude = self._SHAKE_PEAK * punch
+            out = _shift_frame(
+                frame, int(round(rng.uniform(-1.0, 1.0) * amplitude)), np
+            )
+            out = _shift_frame(
+                out, int(round(rng.uniform(-1.0, 1.0) * amplitude)), np, axis=0
+            )
+            return _scale_center(out, 1.0 + 0.04 * punch, cv2, np)
+
+        if style == "glitch":
+            rng = random.Random(frame_index)
+            out = frame.copy()
+            split = int(round(self._GLITCH_SPLIT_PEAK * punch))
+            if split:
+                out[..., 2] = _shift_frame(frame, split, np)[..., 2]
+                out[..., 0] = _shift_frame(frame, -split, np)[..., 0]
+            height = out.shape[0]
+            max_shift = int(round(self._GLITCH_SHIFT_PEAK * punch))
+            if max_shift > 0:
+                for _ in range(3):
+                    band_h = rng.randint(4, max(5, height // 8))
+                    top = rng.randint(0, max(0, height - band_h))
+                    delta = rng.randint(-max_shift, max_shift)
+                    out[top : top + band_h] = _shift_frame(
+                        out[top : top + band_h], delta, np
+                    )
+            jitter = int(round(self._GLITCH_SHAKE_PEAK * punch))
+            if jitter > 0:
+                out = _shift_frame(out, rng.randint(-jitter, jitter), np)
+            return np.ascontiguousarray(out)
 
         return frame
 

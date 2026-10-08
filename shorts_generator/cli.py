@@ -179,7 +179,8 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="LIST",
         help="comma-separated transition styles rotated across cuts: "
-        "dissolve, fade, flash, zoom (default: dissolve)",
+        "dissolve, merge, fade, flash, zoom, chroma, whip, spin, shake, glitch "
+        "(default: dissolve)",
     )
     parser.add_argument(
         "--cut-effect-max",
