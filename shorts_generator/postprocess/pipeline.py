@@ -12,9 +12,12 @@
 3. re-frame the clip into the vertical frame, filling the empty area with a
    blurred copy of the video when it does not already match the target ratio
    (``FIT_VERTICAL``);
-4. burn the subtitles and overlay the banner onto the video;
-5. mix a background music track under the existing audio;
-6. write the result to disk and — with ``UNIQUE_METADATA`` — strip the container
+4. screen-blend the full-screen effect overlay (``EFFECT_OPACITY``, a random
+   light/particle footage from the fixed ``effects/`` folder) over the whole
+   picture, so it sits after the colour/uniqueness pass and below the text;
+5. burn the subtitles and overlay the banner onto the video;
+6. mix a background music track under the existing audio;
+7. write the result to disk and — with ``UNIQUE_METADATA`` — strip the container
    tags and stamp a fresh unique comment, so the file bytes differ too.
 
 The input's own audio is always kept and the music is mixed *under* it, so an
@@ -53,6 +56,7 @@ from .fonts import resolve_font_path
 from .layout import build_vertical_clip, needs_vertical_fit
 from .log import log
 from .music import build_music_audio, resolve_music_file
+from .overlay import build_effect_overlay
 from .subtitles import (
     SubtitleItem,
     build_subtitle_clips_from_items,
@@ -542,11 +546,12 @@ def run(
         burn_subtitles: whether to attempt the subtitle stage.
         add_music: whether to attempt the music stage.
         apply_picture: whether to touch the *picture* at all — the colour/lens
-            effects, the ``SPEED`` change, the vertical re-framing and the
-            banner. When ``False`` only the requested stage (subtitles and/or
-            music) runs and the source video is passed through untouched, which
-            is what keeps the commands modular (e.g. ``music`` must add audio
-            only and never recolour or re-frame the video).
+            effects, the ``SPEED`` change, the vertical re-framing, the
+            full-screen effect overlay (``EFFECT_OPACITY``) and the banner.
+            When ``False`` only the requested stage (subtitles and/or music)
+            runs and the source video is passed through untouched, which is
+            what keeps the commands modular (e.g. ``music`` must add audio only
+            and never recolour or re-frame the video).
         subtitle_file: explicit ``.srt`` to burn (overrides ``SUBTITLE_SOURCE``).
         subtitle_items: in-memory subtitle entries to burn; when given they are
             used directly and no ``.srt`` is read (the ``all`` pipeline passes the
@@ -615,6 +620,7 @@ def run(
         raise
 
     music_source = None
+    effect_source = None
     try:
         width, height = video_clip.size
         video_duration = float(video_clip.duration or 0.0)
@@ -633,6 +639,16 @@ def run(
         if apply_picture and needs_vertical_fit(video_clip, settings):
             final_clip = build_vertical_clip(video_clip, settings)
             final_width, final_height = (int(value) for value in final_clip.size)
+
+        # --- full-screen effect overlay ----------------------------------
+        # A light/particle footage from the fixed ``effects/`` folder is
+        # screened over the whole (already re-framed) picture. It lands here —
+        # after the colour/uniqueness pass baked above and before the subtitles
+        # and the banner drawn below — so the effect tints the video itself
+        # while the text stays crisp. ``EFFECT_OPACITY=0`` (the default) or a
+        # missing footage leaves the picture untouched.
+        if apply_picture:
+            final_clip, effect_source = build_effect_overlay(final_clip, settings)
 
         # --- overlays: burned-in subtitles + banner ----------------------
         # The font is only needed when something textual is drawn (subtitles or
@@ -725,6 +741,8 @@ def run(
         _safe_close(video_clip)
         if music_source is not None:
             _safe_close(music_source)
+        if effect_source is not None:
+            _safe_close(effect_source)
         _remove_file(scrubbed_input)
         _remove_file(effects_input)
 

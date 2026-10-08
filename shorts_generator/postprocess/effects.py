@@ -26,6 +26,10 @@ and the audio fingerprint:
 * ``UNIQUE_CROP`` — trims a few pixels off every edge and stretches the frame
   back to its original size (a subtle "punch-in"); geometry is the most
   effective lever against perceptual hashing.
+* ``UNIQUE_STRETCH`` — an anamorphic stretch: the picture is scaled along one
+  axis and center-cropped back to the frame size, so the output geometry is
+  unchanged but every column (positive, horizontal) or row (negative, vertical)
+  moves by a fraction of a percent — another strong frame-hash mover.
 * ``UNIQUE_NOISE`` — temporal grain (``noise``): a fresh random pattern on every
   frame, which disrupts the pixel statistics the perceptual hash is built from.
 * ``UNIQUE_BRIGHTNESS`` / ``UNIQUE_CONTRAST`` / ``UNIQUE_GAMMA`` / ``UNIQUE_HUE``
@@ -34,7 +38,7 @@ and the audio fingerprint:
 * ``UNIQUE_PITCH`` — a micro pitch shift (``asetrate`` + ``atempo``) that moves
   the audio fingerprint without changing the clip's duration; ``UNIQUE_LOUDNESS``
   and ``UNIQUE_GAIN`` reshape the loudness.
-* ``UNIQUE_RANDOMIZE`` — jitters the *numeric* parameters (crop, noise,
+* ``UNIQUE_RANDOMIZE`` — jitters the *numeric* parameters (crop, stretch, noise,
   brightness, contrast, gamma, hue, pitch) a little on every render, so each
   exported file is a distinct variant of the same edit; the boolean switches
   (``UNIQUE_MIRROR`` / ``UNIQUE_LOUDNESS`` / ``UNIQUE_METADATA``) are left as
@@ -97,6 +101,16 @@ def _fmt(value: float) -> str:
     return text or "0"
 
 
+def _even(expr: str) -> str:
+    """Wrap a dimension expression in even-rounding ``trunc``.
+
+    Encoders need even frame dimensions (chroma is subsampled 2x2), so a
+    scaled/cropped size derived from a fractional stretch factor is rounded
+    down to the nearest even pixel right inside the filtergraph.
+    """
+    return f"trunc(({expr})/2)*2"
+
+
 @dataclass(frozen=True)
 class Uniqueness:
     """The resolved anti-duplicate parameters for a single render.
@@ -107,6 +121,7 @@ class Uniqueness:
 
     mirror: bool = False
     crop: int = 0
+    stretch: float = 0.0
     noise: float = 0.0
     brightness: float = 0.0
     contrast: float = 1.0
@@ -145,6 +160,7 @@ def resolve_uniqueness(settings: Settings) -> Uniqueness:
     """
     mirror = bool(settings.unique_mirror)
     crop = max(0, int(settings.unique_crop))
+    stretch = float(settings.unique_stretch)
     noise = max(0.0, float(settings.unique_noise))
     brightness = float(settings.unique_brightness)
     contrast = max(0.0, float(settings.unique_contrast))
@@ -157,6 +173,11 @@ def resolve_uniqueness(settings: Settings) -> Uniqueness:
     if settings.unique_randomize:
         spread = _clamp(float(settings.unique_jitter), 0.0, 1.0)
         crop = int(round(_clamp(_jitter(float(crop or 4), 4.0, spread), 0, 12)))
+        # ``stretch`` is signed (its sign picks the axis), so it is jittered
+        # around its own value with a ±2% amplitude and stays free to cross
+        # zero, unlike the crop amount above. When it is off (0) the jitter
+        # itself becomes a small signed stretch that lights the effect up.
+        stretch = _clamp(_jitter(stretch, 2.0, spread), -6.0, 6.0)
         noise = _clamp(_jitter(noise or 3.0, 3.0, spread), 0.0, 10.0)
         brightness = _clamp(_jitter(brightness, 0.02, spread), -0.1, 0.1)
         contrast = _clamp(_jitter(contrast, 0.03, spread), 0.8, 1.2)
@@ -167,6 +188,7 @@ def resolve_uniqueness(settings: Settings) -> Uniqueness:
     return Uniqueness(
         mirror=mirror,
         crop=crop,
+        stretch=stretch,
         noise=noise,
         brightness=brightness,
         contrast=contrast,
@@ -210,6 +232,22 @@ def build_filter_chain(
         # its original size: a subtle "punch-in" that shifts the whole picture.
         filters.append(f"crop=iw-{2 * crop_px}:ih-{2 * crop_px}:{crop_px}:{crop_px}")
         filters.append(f"scale=iw+{2 * crop_px}:ih+{2 * crop_px}")
+
+    stretch = float(u.stretch)
+    if abs(stretch) > _NEUTRAL_EPSILON:
+        # An anamorphic stretch: scale the picture along a single axis, then
+        # center-crop it back to the frame size, so its geometry is unchanged
+        # but every column (horizontal, positive) or row (vertical, negative)
+        # lands a fraction of a percent away from where it was — enough to move
+        # the perceptual hash while staying invisible. ``_even`` keeps the
+        # working and final dimensions even for the encoder.
+        factor = _fmt(1.0 + abs(stretch) / 100.0)
+        if stretch > 0.0:
+            filters.append(f"scale={_even(f'iw*{factor}')}:ih")
+            filters.append(f"crop={_even(f'iw/{factor}')}:ih")
+        else:
+            filters.append(f"scale=iw:{_even(f'ih*{factor}')}")
+            filters.append(f"crop=iw:{_even(f'ih/{factor}')}")
 
     # --- tone / colour ----------------------------------------------------
     # ``eq`` carries contrast, brightness, saturation and gamma in a single

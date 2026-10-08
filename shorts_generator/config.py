@@ -497,6 +497,19 @@ class Settings:
     # faster) and values below ``1`` slow it down (``0.5`` is half speed).
     speed: float = 1.0
 
+    # Полноэкранный эффект поверх видео ------------------------------------
+    # На весь кадр накладывается полупрозрачный световой/particle-футаж
+    # (переливы света, боке, снежинки, блёстки и т.п.) из фиксированной папки
+    # ``effects/`` (рядом с ``music/``); папка не настраивается через env.
+    # Наложение идёт на всё видео уже ПОСЛЕ цветокора и уникализации (оба
+    # запекаются в исходник проходом FFmpeg) и ДО субтитров и баннера, поэтому
+    # эффект ложится на само видео, а текст остаётся чётким. Смешивание —
+    # «screen» (светлое на чёрном фоне футажа не затемняет кадр).
+    # EFFECT_OPACITY — сила наложения 0..1: 0 (по умолчанию) выключает эффект
+    # полностью, 1 — максимальная. Выбрать конкретный футаж нельзя: движок
+    # берёт случайный файл из папки на каждый клип (как MUSIC для папки).
+    effect_opacity: float = 0.0
+
     # Уникализация (обход детекции дубликатов) ----------------------------
     # Набор лёгких, почти незаметных изменений, которые сдвигают перцептивный
     # хеш кадра и аудио-отпечаток, чтобы площадка не считала ролик копией уже
@@ -512,6 +525,12 @@ class Settings:
     # Меняет положение каждого пикселя — один из самых эффективных приёмов
     # против перцептивного хеширования. 0 отключает.
     unique_crop: int = 0
+    # Растяжение кадра: небольшое анаморфное изменение пропорций — картинка
+    # растягивается по одной оси и обрезается обратно до размера кадра, поэтому
+    # кадр остаётся того же размера, а каждая колонка (или строка) смещается на
+    # доли процента. Значение в процентах (-10..10): плюс — растяжение по
+    # горизонтали, минус — по вертикали; 0 отключает.
+    unique_stretch: float = 0.0
     # Зернистость: временной шум на каждый кадр (0..100). 0 отключает. Даже
     # слабое значение (3-5) заметно сдвигает перцептивный хеш.
     unique_noise: float = 0.0
@@ -657,6 +676,7 @@ _FLOAT_FIELDS = {
     "sharpness",
     "chromatic_aberration",
     "speed",
+    "effect_opacity",
     "slide_transition_gap",
     "slide_range",
     "cut_effect_duration",
@@ -667,6 +687,7 @@ _FLOAT_FIELDS = {
     "unique_hue",
     "unique_pitch",
     "unique_gain",
+    "unique_stretch",
     "unique_jitter",
     "visual_indexer_florence_scene_threshold",
     "visual_indexer_max_scene_seconds",
@@ -861,8 +882,12 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("CHROMATIC_ABERRATION must be zero or greater")
     if settings.speed <= 0:
         raise ConfigError("SPEED must be greater than 0")
+    if not 0.0 <= settings.effect_opacity <= 1.0:
+        raise ConfigError("EFFECT_OPACITY must be between 0 and 1")
     if not 0 <= settings.unique_crop <= 200:
         raise ConfigError("UNIQUE_CROP must be between 0 and 200 pixels")
+    if not -10.0 <= settings.unique_stretch <= 10.0:
+        raise ConfigError("UNIQUE_STRETCH must be between -10 and 10 percent")
     if not 0.0 <= settings.unique_noise <= 100.0:
         raise ConfigError("UNIQUE_NOISE must be between 0 and 100")
     if not -1.0 <= settings.unique_brightness <= 1.0:

@@ -363,6 +363,17 @@ def _add_render_options(parser: argparse.ArgumentParser) -> None:
         "it down (0.5 is half speed); the audio is re-timed to match "
         "(default: 1.0)",
     )
+    parser.add_argument(
+        "--effect-opacity",
+        dest="effect_opacity",
+        type=float,
+        default=None,
+        metavar="N",
+        help="strength (0..1) of the full-screen effect overlay: a random "
+        "light/particle footage from the fixed effects/ folder is screened over "
+        "the whole picture, after the colour/uniqueness pass and below the "
+        "subtitles; 0 disables it (default: 0)",
+    )
 
 
 def _add_uniqueness_options(parser: argparse.ArgumentParser) -> None:
@@ -383,6 +394,16 @@ def _add_uniqueness_options(parser: argparse.ArgumentParser) -> None:
         metavar="PX",
         help="trim PX pixels off every edge and stretch the frame back to its "
         "original size — the strongest frame-hash mover (default: 0)",
+    )
+    parser.add_argument(
+        "--unique-stretch",
+        dest="unique_stretch",
+        type=float,
+        default=None,
+        metavar="PERCENT",
+        help="stretch the frame along one axis and crop it back to size — a "
+        "small anamorphic aspect change; + stretches horizontally, - "
+        "vertically (-10..10, default: 0)",
     )
     parser.add_argument(
         "--unique-noise",
@@ -634,7 +655,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Render a single random frame through the same picture stages as a "
             "real short (vertical frame + blurred background, colour/lens "
-            "effects, banner and the subtitle look) and save it as a PNG. No "
+            "effects, the effect overlay, banner and the subtitle look) and "
+            "save it as a PNG. No "
             "transcription happens: when subtitles are on the placeholder text "
             '"тестовый кадр" is drawn, so the look can be tuned in seconds.'
         ),

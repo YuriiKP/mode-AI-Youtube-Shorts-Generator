@@ -3,8 +3,8 @@
 Rendering a real short takes a while: every frame is encoded, the audio is
 mixed and, for the ``all`` command, Whisper runs first. When the goal is only
 to tune the *picture* — the vertical frame with its blurred background, the
-colour/lens effects, the banner and the subtitle look — that whole pipeline is
-overkill.
+colour/lens effects, the full-screen effect overlay (``EFFECT_OPACITY``), the
+banner and the subtitle look — that whole pipeline is overkill.
 
 This module renders **one random frame** through exactly the same stages a real
 render uses, so what you see is what the final clip will look like, but it
@@ -38,6 +38,7 @@ from .postprocess.ffmpeg import configure_ffmpeg
 from .postprocess.fonts import resolve_font_path
 from .postprocess.layout import build_vertical_clip, needs_vertical_fit
 from .postprocess.log import log
+from .postprocess.overlay import build_effect_overlay
 from .postprocess.pipeline import (
     ProcessingError,
     _open_video,
@@ -161,9 +162,15 @@ def _compose_frame(
     duration = _PREVIEW_DURATION
     base = ImageClip(frame).with_duration(duration)
     vertical = base
+    overlay_source = None
     try:
         if needs_vertical_fit(base, settings):
             vertical = build_vertical_clip(base, settings)
+
+        # Full-screen effect overlay: screened over the whole (re-framed) frame,
+        # below the subtitle/banner overlays — the same position it takes in the
+        # real pipeline, so ``EFFECT_OPACITY`` previews faithfully.
+        vertical, overlay_source = build_effect_overlay(vertical, settings)
 
         width, height = (int(value) for value in vertical.size)
 
@@ -192,6 +199,8 @@ def _compose_frame(
         finally:
             _safe_close(composite)
     finally:
+        if overlay_source is not None:
+            _safe_close(overlay_source)
         if vertical is not base:
             _safe_close(vertical)
         _safe_close(base)

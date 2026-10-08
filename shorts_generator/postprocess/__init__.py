@@ -8,6 +8,9 @@ Every stage is optional and independent:
 
 * **vertical fit** — re-frame the clip to ``FIT_ASPECT_RATIO`` (``9:16`` by
   default), filling the empty area with a blurred copy of the video;
+* **effect overlay** — screen-blend a random light/particle footage from the
+  fixed ``effects/`` folder over the whole picture (``EFFECT_OPACITY``), after
+  the colour/uniqueness pass and below the text;
 * **banner** — overlay an image (``BANNER_IMAGE``) or a text band
   (``BANNER_TEXT``) on top of the frame;
 * **subtitles** — burn an ``.srt`` onto the video;

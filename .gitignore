@@ -14,6 +14,7 @@ music/
 fonts/
 banner/
 video/
+effects/
 
 # Publisher: browser profiles hold cookies/logins (secrets) and the upload
 # history database is machine-local.
