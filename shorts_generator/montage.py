@@ -13,7 +13,7 @@ import json
 import os
 import re
 import subprocess
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
 from .cues import phrase_boundaries
@@ -28,15 +28,15 @@ LLMFn = Callable[[str], str]
 #
 # Целевая общая длительность, секунды. На неё ориентируется промпт, и к ней
 # доводится сумма отрезков после ответа модели (см. ``_fit_total_duration``).
-MONTAGE_TARGET_SECONDS = 60.0
+MONTAGE_TARGET_SECONDS = 150.0
 # Рамки одного отрезка: слишком короткие (<3–5с) дают рваный ритм, слишком
 # длинные — «провисшую» динамику. Отрезки вне этих рамок отбрасываются.
 MONTAGE_MIN_SEGMENT_SECONDS = 5.0
-MONTAGE_MAX_SEGMENT_SECONDS = 20.0
+MONTAGE_MAX_SEGMENT_SECONDS = 50.0
 # Окно общей длительности. Монтаж короче или длиннее не принимается: сумму
 # подтягивают (``_fit_total_duration``), а промпт переспрашивают с уточнением.
 MONTAGE_MIN_TOTAL_SECONDS = 50.0
-MONTAGE_MAX_TOTAL_SECONDS = 90.0
+MONTAGE_MAX_TOTAL_SECONDS = 100.0
 
 # ПРАВИЛА ОТБОРА ОТРЕЗКОВ:
 # 1. Связность по смыслу: Отрезки должны логически переходить друг в друга. Не прыгай между несвязанными темами. Если это невозможно — бери один длинный связный кусок.
@@ -47,7 +47,11 @@ MONTAGE_MAX_TOTAL_SECONDS = 90.0
 
 # 1. Динамика и виральность: Выбирай моменты с максимальным вовлечением — конфликты, эмоции, неожиданные повороты, смешные реакции, интригующие вопросы.
 # 5. Длительность отрезков: Каждый отрезок от {min_segment}с до {max_segment}с. Слишком короткие (<3с) создают рваный ритм.
-MONTAGE_SYSTEM_PROMPT = """Ты элитный монтажёр коротких вертикальных видео. Твоя задача — отобрать самые динамичные и связные по смыслу отрезки из длинного видео и собрать из них один интересный «хуковый» клип длительностью {target_duration} секунд.
+MONTAGE_SYSTEM_PROMPT = """
+Ты элитный монтажёр коротких вертикальных видео. Монтируешь ХУКОВЫЕ видео.
+Твоя задача — смонтировать видео из предоставленной транскрипции аудио и небольших заметок визуала. Смонтируй видео из 3 отрезков.
+По смыслу все фрагменты должны подходить друг другу и складываться в одну историю.
+Видео должно быть длительностью - {target_duration} секунд.
 
 {content_hint}
 
@@ -285,6 +289,107 @@ def _fit_total_duration(
     return segments
 
 
+def _cue_windows(transcript: Dict) -> List[Tuple[float, float]]:
+    """Отсортированные ``(start, end)`` реплики транскрипта, мусор отброшен."""
+    cues: List[Tuple[float, float]] = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start:
+            cues.append((start, end))
+    cues.sort()
+    return cues
+
+
+def _pad_segments(
+    segments: List[Dict],
+    transcript: Dict,
+    *,
+    start_padding: float,
+    end_padding: float,
+) -> List[Dict]:
+    """Добавить тот же запас по краям, что оставляет обычный режим.
+
+    Обычный маршрут никогда не режет фразу ровно по её границе:
+    ``highlights.snap_highlights_to_transcript`` оставляет
+    ``CLIP_START_PADDING`` / ``CLIP_END_PADDING`` секунд запаса после границы
+    фразы (с обрезкой по соседней реплике, чтобы не залезть в неё). Это нужно
+    потому, что конец реплики у Whisper стоит на пару фреймов раньше реального
+    конца речи, и рез ровно по границе срезает хвост последнего слова. Монтаж
+    резал отрезки прямо по границе, поэтому последняя фраза каждого отрезка
+    теряла этот хвост; здесь запас возвращается.
+
+    Запас только расширяет окно и не выходит за рамки материала: конец тянется
+    вперёд на ``end_padding``, но не дальше начала следующей реплики, начала
+    следующего отрезка и конца видео (и никогда не заводится назад, за исходный
+    конец); начало тянется назад на ``start_padding``, но не дальше конца
+    предыдущей реплики и не дальше нуля. Отрезки монтажа идут встык, поэтому при
+    столкновении запас уступает границе: конец предыдущего отрезка не переходит за
+    начало следующего (и не становится короче своего исходного конца), а начало
+    следующего отрезка подтягивается к концу предыдущего, уже с запасом — иначе
+    два отрезка перекрылись бы и на склейке продублировался бы кусок речи.
+    Вплотную стоящий отрезок из-за этого может начаться на пару сотых позже своего
+    исходного начала.
+    """
+    cues = _cue_windows(transcript)
+    video_end = float(transcript.get("duration") or 0.0)
+
+    for index, seg in enumerate(segments):
+        start = float(seg["start_time"])
+        end = float(seg["end_time"])
+
+        # Начало: тянем назад на запас, но не дальше предыдущей реплики и не
+        # заходя в предыдущий (уже с запасом) отрезок.
+        previous_cue_end = max((c[1] for c in cues if c[1] <= start), default=None)
+        new_start = start - start_padding
+        if previous_cue_end is not None:
+            new_start = max(new_start, previous_cue_end + 0.02)
+        new_start = max(0.0, min(new_start, start))
+        if index > 0:
+            new_start = max(new_start, float(segments[index - 1]["end_time"]) + 0.02)
+
+        # Конец: тянем вперёд на запас, но не в следующую реплику, не в следующий
+        # отрезок и не за конец видео.
+        next_cue_start = min((c[0] for c in cues if c[0] >= end), default=None)
+        new_end = end + end_padding
+        if next_cue_start is not None:
+            new_end = min(new_end, next_cue_start - 0.02)
+        if index + 1 < len(segments):
+            new_end = min(new_end, float(segments[index + 1]["start_time"]) - 0.02)
+        if video_end:
+            new_end = min(new_end, video_end)
+        new_end = max(new_end, end)
+
+        if new_end <= new_start:
+            new_end = new_start + 0.04
+
+        seg["start_time"] = round(new_start, 3)
+        seg["end_time"] = round(new_end, 3)
+        seg["duration"] = round(new_end - new_start, 3)
+
+    return segments
+
+
+def segment_join_times(segments: List[Dict]) -> List[float]:
+    """Моменты (секунды по таймлайну склейки), где отрезки стыкуются.
+
+    Каждый отрезок идёт сразу за предыдущим, поэтому стык между отрезками *i* и
+    *i + 1* стоит на суммарной длительности всех предыдущих. Это и есть резы,
+    которые создаёт сам монтаж — именно их переходы (``CUT_EFFECT``) обязаны
+    сглаживать в режиме монтажа, а не внутренние склейки исходника
+    (см. ``pipeline._process_montage_one``).
+    """
+    joins: List[float] = []
+    offset = 0.0
+    for seg in segments[:-1]:
+        offset += float(seg["end_time"]) - float(seg["start_time"])
+        joins.append(round(offset, 3))
+    return joins
+
+
 def select_montage_segments(
     transcript: Dict,
     settings: Settings,
@@ -385,6 +490,19 @@ def select_montage_segments(
             )
             if not segments:
                 raise ValueError("no segments left after duration fitting")
+
+            # Тот же запас по краям, что оставляет обычный режим (см.
+            # ``_pad_segments``): без него рез встаёт ровно на конец реплики и
+            # срезает хвост последнего слова. Делается после доводки длительности,
+            # чтобы ``_fit_total_duration`` не срезал запас обратно, и сумма
+            # считается уже с ним — так окно 50–90с проверяется по итогу.
+            if settings.clip_snap_to_transcript:
+                segments = _pad_segments(
+                    segments,
+                    transcript,
+                    start_padding=settings.clip_start_padding,
+                    end_padding=settings.clip_end_padding,
+                )
 
             total = _total_duration(segments)
             concept = str(parsed.get("montage_concept", "")).strip()

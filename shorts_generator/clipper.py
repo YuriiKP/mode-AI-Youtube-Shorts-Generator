@@ -193,7 +193,8 @@ class _CutEffectRunner:
     so the cross-blend styles (``dissolve`` / ``merge``) can mix the frames before
     a cut with the ones after it; the punch styles (``zoom`` / ``chroma`` / ...)
     need no history. The clip keeps its length and its audio, so the caller's
-    timings never shift.
+    timings never shift. ``strength`` scales the magnitude of every style, so a
+    bolder or subtler look needs no per-style tuning.
     """
 
     _ZOOM_PEAK: float = 0.12  # ``zoom`` punch magnitude
@@ -212,11 +213,18 @@ class _CutEffectRunner:
     _BLEND_STYLES: Tuple[str, ...] = ("dissolve", "merge")
 
     def __init__(
-        self, effects: "Sequence[CutEffect]", crop_w: int, crop_h: int
+        self,
+        effects: "Sequence[CutEffect]",
+        crop_w: int,
+        crop_h: int,
+        strength: float = 1.0,
     ) -> None:
         self.effects = effects
         self.crop_w: int = crop_w
         self.crop_h: int = crop_h
+        # Magnitude multiplier shared by every style; clamped at zero so a
+        # negative value degenerates to "no effect" instead of flipping styles.
+        self.strength: float = max(0.0, float(strength))
         self.index: int = 0
         self._snapshot = None
         self._punch_dir: int = 1  # alternates the direction of directional styles
@@ -262,10 +270,12 @@ class _CutEffectRunner:
         before = max(1, cut - start)
         after = max(1, end - cut)
         span = max(1, end - start)
+        strength = self.strength
 
         # Triangular ramp: 0 at the window edges, 1 exactly at the cut. The punch
         # styles scale their strength with it, so the effect peaks on the cut and
-        # fades back to the untouched frame before the window ends.
+        # fades back to the untouched frame before the window ends. ``strength``
+        # is the user-facing multiplier stacked on top of that ramp.
         if frame_index < cut:
             punch = (frame_index - start + 1) / before
         else:
@@ -274,69 +284,86 @@ class _CutEffectRunner:
         if style in self._BLEND_STYLES:
             if frame_index < cut:
                 if style == "merge":
-                    return _gaussian(frame, self._MERGE_BLUR_PEAK * punch, cv2, np)
+                    return _gaussian(
+                        frame, self._MERGE_BLUR_PEAK * punch * strength, cv2, np
+                    )
                 return frame  # frames before the cut are written untouched
+            if strength <= 0.0:
+                return frame  # strength 0 degenerates the blend into a plain cut
             if self._snapshot is None:
                 history = list(self.buffer) if self.buffer is not None else []
                 self._snapshot = history[-after:]
             step = frame_index - cut
             if step >= len(self._snapshot):
                 return frame
-            alpha = (step + 1) / after
+            # Cross-blend ramp 0 -> 1 over the window. ``strength`` reshapes the
+            # ramp without moving its ends: a bolder value snaps the two shots
+            # over sooner while the blend still finishes exactly at the window
+            # edge. A plain linear scale would instead freeze the old frame and
+            # jump when the window ends.
+            ratio = (step + 1) / after
+            alpha = ratio if strength == 1.0 else ratio ** (1.0 / strength)
             out = _mix(self._snapshot[step], frame, alpha, np)
             if style == "merge":
-                out = _gaussian(out, self._MERGE_BLUR_PEAK * punch, cv2, np)
+                out = _gaussian(out, self._MERGE_BLUR_PEAK * punch * strength, cv2, np)
             return out
 
         if style in ("fade", "flash"):
             color = 0.0 if style == "fade" else 255.0
-            mixed = frame.astype(np.float32) * (1.0 - punch) + color * punch
+            amount = min(1.0, punch * strength)
+            mixed = frame.astype(np.float32) * (1.0 - amount) + color * amount
             return _as_u8(mixed, np)
 
         if style == "zoom":
             position = (frame_index - start) / span
-            scale = 1.0 + self._ZOOM_PEAK * math.sin(math.pi * position)
+            scale = 1.0 + self._ZOOM_PEAK * strength * math.sin(math.pi * position)
             return _scale_center(frame, scale, cv2, np)
 
         if style == "chroma":
             # Zoom punch plus a red/blue split that peaks on the cut — the classic
             # "chromatic zoom" edit transition.
-            out = _scale_center(frame, 1.0 + self._CHROMA_ZOOM_PEAK * punch, cv2, np)
-            return _chroma_split(out, int(round(self._CHROMA_SPLIT_PEAK * punch)), np)
+            out = _scale_center(
+                frame, 1.0 + self._CHROMA_ZOOM_PEAK * punch * strength, cv2, np
+            )
+            return _chroma_split(
+                out, int(round(self._CHROMA_SPLIT_PEAK * punch * strength)), np
+            )
 
         if style == "whip":
             direction = self._punch_dir
             shifted = _shift_frame(
-                frame, int(round(self._WHIP_SHIFT_PEAK * punch)) * direction, np
+                frame,
+                int(round(self._WHIP_SHIFT_PEAK * punch * strength)) * direction,
+                np,
             )
-            length = int(round(self._WHIP_BLUR_PEAK * punch))
+            length = int(round(self._WHIP_BLUR_PEAK * punch * strength))
             return _as_u8(_motion_blur(shifted, length, np), np)
 
         if style == "spin":
-            angle = self._SPIN_PEAK * punch * self._punch_dir
+            angle = self._SPIN_PEAK * strength * punch * self._punch_dir
             out = _rotate(frame, angle, cv2, np)
-            return _scale_center(out, 1.0 + 0.05 * punch, cv2, np)
+            return _scale_center(out, 1.0 + 0.05 * strength * punch, cv2, np)
 
         if style == "shake":
             rng = random.Random(frame_index)
-            amplitude = self._SHAKE_PEAK * punch
+            amplitude = self._SHAKE_PEAK * punch * strength
             out = _shift_frame(
                 frame, int(round(rng.uniform(-1.0, 1.0) * amplitude)), np
             )
             out = _shift_frame(
                 out, int(round(rng.uniform(-1.0, 1.0) * amplitude)), np, axis=0
             )
-            return _scale_center(out, 1.0 + 0.04 * punch, cv2, np)
+            return _scale_center(out, 1.0 + 0.04 * strength * punch, cv2, np)
 
         if style == "glitch":
             rng = random.Random(frame_index)
             out = frame.copy()
-            split = int(round(self._GLITCH_SPLIT_PEAK * punch))
+            split = int(round(self._GLITCH_SPLIT_PEAK * punch * strength))
             if split:
                 out[..., 2] = _shift_frame(frame, split, np)[..., 2]
                 out[..., 0] = _shift_frame(frame, -split, np)[..., 0]
             height = out.shape[0]
-            max_shift = int(round(self._GLITCH_SHIFT_PEAK * punch))
+            max_shift = int(round(self._GLITCH_SHIFT_PEAK * punch * strength))
             if max_shift > 0:
                 for _ in range(3):
                     band_h = rng.randint(4, max(5, height // 8))
@@ -345,7 +372,7 @@ class _CutEffectRunner:
                     out[top : top + band_h] = _shift_frame(
                         out[top : top + band_h], delta, np
                     )
-            jitter = int(round(self._GLITCH_SHAKE_PEAK * punch))
+            jitter = int(round(self._GLITCH_SHAKE_PEAK * punch * strength))
             if jitter > 0:
                 out = _shift_frame(out, rng.randint(-jitter, jitter), np)
             return np.ascontiguousarray(out)
@@ -365,8 +392,19 @@ def _reframe_vertical(
     cut_effect_duration: float = 0.25,
     cut_effect_types: Sequence[str] = ("dissolve",),
     cut_effect_max: int = 3,
+    cut_effect_strength: float = 1.0,
+    cut_effect_times: Optional[Sequence[float]] = None,
 ) -> str:
-    """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
+    """Crop the cut clip to the target aspect ratio, tracking faces if possible.
+
+    ``cut_effect_times`` lets the caller supply the transition times explicitly
+    (seconds on ``in_path``'s own timeline) instead of letting the scene-cut
+    detector find them inside the clip. The montage route uses this: its hard
+    cuts are the joins it created by gluing several source windows together, not
+    the source's own scene cuts, so it passes the join times and the detector is
+    skipped for the cut effect only (``None`` — the default — keeps the regular
+    behaviour of blending the clip's internal scene cuts).
+    """
     try:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
@@ -436,11 +474,17 @@ def _reframe_vertical(
     slide_base = (max_x0 - travel) // 2
 
     # Scene cuts inside the clip are needed by both the slide (to know where to
-    # pan) and the cut effects (to know where to blend), so detect them once.
+    # pan) and the cut effects (to know where to blend), so detect them once —
+    # unless the caller already named the cut times (``cut_effect_times``): then
+    # the detector is only needed to drive the slide, and the cut effect runs on
+    # the supplied times instead of on the source's own scene cuts.
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
     duration = (frame_count / fps) if fps else 0.0
+    explicit_cuts = cut_effect_times is not None
     transitions: List[float] = []
-    if (slide_effect and max_x0 > 0 and travel > 0) or cut_effect:
+    if (slide_effect and max_x0 > 0 and travel > 0) or (
+        cut_effect and not explicit_cuts
+    ):
         try:
             transitions = detect_transitions(in_path)
         except Exception as exc:
@@ -458,20 +502,41 @@ def _reframe_vertical(
 
     cut_effects = []
     if cut_effect:
+        # Explicit times (montage joins) win over the detected scene cuts; they
+        # are filtered to the clip's own range so a stray value cannot ask for a
+        # window that runs off either end of the material.
+        cut_times = (
+            [float(t) for t in cut_effect_times if 0.0 < float(t) < duration]
+            if explicit_cuts
+            else transitions
+        )
         cut_effects = build_cut_effects(
-            transitions,
+            cut_times,
             duration,
             fps,
             window_seconds=cut_effect_duration,
             styles=parse_cut_effect_styles(cut_effect_types),
             max_count=cut_effect_max,
         )
-        print(
-            f"[clip] cut effect: {len(transitions)} transition(s) -> "
-            f"{len(cut_effects)} blend(s)",
-            flush=True,
-        )
-    cut_runner = _CutEffectRunner(cut_effects, crop_w, crop_h) if cut_effects else None
+        # The regular route keeps its original wording; only the explicit-cut
+        # route (montage) announces a different source of the times.
+        if explicit_cuts:
+            print(
+                f"[clip] cut effect: {len(cut_times)} given cut(s) -> "
+                f"{len(cut_effects)} blend(s)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[clip] cut effect: {len(transitions)} transition(s) -> "
+                f"{len(cut_effects)} blend(s)",
+                flush=True,
+            )
+    cut_runner = (
+        _CutEffectRunner(cut_effects, crop_w, crop_h, strength=cut_effect_strength)
+        if cut_effects
+        else None
+    )
 
     frame_index = 0
     last_center: Optional[Tuple[int, int]] = None
@@ -577,6 +642,8 @@ def reframe_video(
     cut_effect_duration: float = 0.25,
     cut_effect_types: Sequence[str] = ("dissolve",),
     cut_effect_max: int = 3,
+    cut_effect_strength: float = 1.0,
+    cut_effect_times: Optional[Sequence[float]] = None,
 ) -> str:
     """Reframe an already-built video to ``aspect_ratio``, without re-cutting.
 
@@ -587,6 +654,13 @@ def reframe_video(
     :func:`_reframe_vertical`). The caller keeps the file's timeline untouched,
     which is what lets timings computed for the input still line up after the
     call — subtitles and music therefore stay in sync.
+
+    The cut effect (``cut_effect`` and its friends) works the same way here as in
+    ``crop_clip``: it blends the scene cuts found inside ``in_path``. Pass
+    ``cut_effect_times`` to blend a different set of cuts instead — the montage
+    route passes the times of its own joins, so the transitions land on the
+    places the segments were glued together rather than on the source's internal
+    scene cuts.
 
     The montage pipeline uses it right after stitching its segments: those come
     out in the source aspect ratio, so the stitched file still has to be cut to
@@ -613,6 +687,8 @@ def reframe_video(
         cut_effect_duration=cut_effect_duration,
         cut_effect_types=cut_effect_types,
         cut_effect_max=cut_effect_max,
+        cut_effect_strength=cut_effect_strength,
+        cut_effect_times=cut_effect_times,
     )
 
 
@@ -630,6 +706,7 @@ def crop_clip(
     cut_effect_duration: float = 0.25,
     cut_effect_types: Sequence[str] = ("dissolve",),
     cut_effect_max: int = 3,
+    cut_effect_strength: float = 1.0,
 ) -> str:
     """Cut + reframe one highlight, returning the mp4 path."""
     cut_path = out_path + ".cut.mp4"
@@ -647,6 +724,7 @@ def crop_clip(
             cut_effect_duration=cut_effect_duration,
             cut_effect_types=cut_effect_types,
             cut_effect_max=cut_effect_max,
+            cut_effect_strength=cut_effect_strength,
         )
     finally:
         if os.path.exists(cut_path):
@@ -667,6 +745,7 @@ def crop_highlights(
     cut_effect_duration: float = 0.25,
     cut_effect_types: Sequence[str] = ("dissolve",),
     cut_effect_max: int = 3,
+    cut_effect_strength: float = 1.0,
     start_index: int = 0,
 ) -> List[Dict]:
     out_dir = out_dir or DEFAULT_OUTPUT_DIR
@@ -699,6 +778,7 @@ def crop_highlights(
                 cut_effect_duration=cut_effect_duration,
                 cut_effect_types=cut_effect_types,
                 cut_effect_max=cut_effect_max,
+                cut_effect_strength=cut_effect_strength,
             )
             results.append({**h, "clip_url": out_path})
         except Exception as e:

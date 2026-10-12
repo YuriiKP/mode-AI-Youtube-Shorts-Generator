@@ -329,6 +329,12 @@ class Settings:
     # Максимум переходов на один клип (0 — выключено). Если подходящих резов
     # больше, берётся равномерная выборка по всему клипу.
     cut_effect_max: int = 3
+    # Сила визуала перехода — общий множитель амплитуды (1.0 — базовая).
+    # Больше 1 — переходы заметнее (сильнее зум/сдвиг/тряска/глитч, а dissolve
+    # и merge проходят резче), меньше 1 — мягче; 0 — эффект вырождается в
+    # прямой рез. У fade/flash значения выше 1 ничего не добавляют: они и так
+    # доходят до полного чёрного/белого.
+    cut_effect_strength: float = 1.0
 
     # LLM (highlight ranking) ---------------------------------------------
     llm_provider: str = "openai"  # openai | deepseek | gemini
@@ -680,6 +686,7 @@ _FLOAT_FIELDS = {
     "slide_transition_gap",
     "slide_range",
     "cut_effect_duration",
+    "cut_effect_strength",
     "unique_noise",
     "unique_brightness",
     "unique_contrast",

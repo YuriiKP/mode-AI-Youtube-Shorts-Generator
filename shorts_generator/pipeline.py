@@ -31,6 +31,7 @@ from .montage import (
     build_montage_transcript,
     create_montage,
     generate_montage_metadata,
+    segment_join_times,
     select_montage_segments,
 )
 from .provider_errors import RunFatalError
@@ -207,6 +208,7 @@ def _process_one(
             cut_effect_duration=settings.cut_effect_duration,
             cut_effect_types=settings.cut_effect_types,
             cut_effect_max=settings.cut_effect_max,
+            cut_effect_strength=settings.cut_effect_strength,
             start_index=start_index,
         )
 
@@ -259,6 +261,13 @@ def _process_montage_one(
     * **постобработка** (``enhance``) — вертикальная подгонка до
       ``FIT_ASPECT_RATIO``, цветокор и эффекты, уникализация, баннер,
       субтитры и музыка.
+
+    Переходы (``CUT_EFFECT``) применяются здесь к **стыкам отрезков**, а не к
+    внутренним склейкам исходника: рез, который вносит сам монтаж, сглаживается
+    переходом на каждом стыке, а собственные склейки источника остаются как есть.
+    Времена стыков известны точно (см. ``montage.segment_join_times``), поэтому
+    они передаются в кроп явно, а не ищутся детектором переходов (как это делает
+    обычный маршрут на внутренних резах одного клипа).
     """
     with timer.stage("transcribe"):
         transcript = transcribe(source_path, settings)
@@ -301,6 +310,17 @@ def _process_montage_one(
         with timer.stage("montage_cut"):
             create_montage(source_path, segments, stitched_path)
 
+        # Cut transitions (CUT_EFFECT) go on the joins *the montage itself makes*,
+        # not on the source's own scene cuts: the source's cuts are part of the
+        # original material, while the joins are the hard cuts this route
+        # introduces — the ones that need smoothing. The join times are known
+        # exactly (the running total of the segment durations), so they are handed
+        # to the crop pass instead of being detected, and every fragment gets its
+        # transition, as the montage route requires. ``CUT_EFFECT_MAX`` therefore
+        # cannot sample them away here — it only toggles the effect (0 = off).
+        join_times = segment_join_times(segments)
+        join_cut_max = len(join_times) if settings.cut_effect_max > 0 else 0
+
         # Crop step — the montage equivalent of what ``crop_highlights`` does per
         # highlight. It runs even when ``enhance`` is off (the ``clip`` route
         # under ``MONTAGE_MODE``), because the re-framing is not part of the
@@ -317,6 +337,12 @@ def _process_montage_one(
                 slide_effect=settings.slide_effect,
                 slide_gap=settings.slide_transition_gap,
                 slide_range=settings.slide_range,
+                cut_effect=settings.cut_effect,
+                cut_effect_duration=settings.cut_effect_duration,
+                cut_effect_types=settings.cut_effect_types,
+                cut_effect_max=join_cut_max,
+                cut_effect_strength=settings.cut_effect_strength,
+                cut_effect_times=join_times,
             )
     finally:
         # The stitched intermediate is only an input to the crop step; on Windows

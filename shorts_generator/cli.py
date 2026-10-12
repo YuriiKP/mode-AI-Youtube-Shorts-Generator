@@ -162,8 +162,9 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         dest="cut_effect",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="blend a short transition over the source scene cuts inside each "
-        "clip, softening the hard cuts (default: off)",
+        help="blend a short transition over the hard cuts: the source scene "
+        "cuts inside each clip, or — in montage mode — the joins between the "
+        "stitched segments (default: off)",
     )
     parser.add_argument(
         "--cut-effect-duration",
@@ -189,6 +190,16 @@ def _add_clip_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="N",
         help="maximum transitions per clip (default: 3)",
+    )
+    parser.add_argument(
+        "--cut-effect-strength",
+        dest="cut_effect_strength",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="multiply the visual magnitude of every cut transition: >1 "
+        "bolder (bigger zoom/shift/flash/glitch), <1 subtler, 0 degenerates "
+        "into a hard cut (default: 1)",
     )
     parser.add_argument(
         "--visual-indexing",
@@ -542,7 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_io(montage)
     # Reused for the transcription-side flags (language, download format,
-    # visual indexing): the per-clip ranking/crop flags are accepted for
+    # visual indexing). The crop flags are honoured as well: the montage applies
+    # ``--face-tracking``/``--slide`` exactly like ``clip``, and ``--cut-effect``
+    # puts its transitions on the joins between the stitched segments rather than
+    # on the source's internal scene cuts (see ``pipeline._process_montage_one``).
+    # Only the per-clip ranking flags (``-n`` and friends) are accepted for
     # consistency with ``clip`` but ignored by the montage path.
     _add_clip_options(montage)
     _add_render_options(montage)
